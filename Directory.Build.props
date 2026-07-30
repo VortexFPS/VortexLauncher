@@ -1,0 +1,32 @@
+<Project>
+  <!-- Shared MSBuild properties for the launcher solution.
+
+       These are NOT optional and they are NOT stylistic. This code was written inside the game repo,
+       where it inherited VortexArena's root Directory.Build.props; extracting `launcher/` into its own
+       repo left it with nothing above it, and the build fails outright without these:
+
+         ImplicitUsings  — Task, HttpClient, Dictionary<,>, IProgress<>, CancellationToken and
+                           STAThreadAttribute are all used with no explicit `using`. Dropping this
+                           produced ~20 CS0246 "type or namespace not found" errors, and then a
+                           cascade of MVVMTK0007/MVVMTK0016 from the CommunityToolkit source
+                           generator, because its partial methods could not bind against code that
+                           no longer compiled. The generator errors are the loud symptom; the missing
+                           usings are the cause.
+         Nullable        — every `string?` / `T?` annotation in Core/ becomes a CS8632 warning
+                           ("annotation ... outside a '#nullable' context") and, worse, stops being
+                           CHECKED. That half is quiet: the code keeps compiling and the null-safety
+                           the annotations claim silently stops being verified.
+
+       Deliberately NOT carried over from the game's props: the Debug `<Optimize>true</Optimize>`
+       block (it exists for the 72 Hz sim's hot loops and only costs step-debugging fidelity here) and
+       the XG_BOTPLAYER gate (game-only, and a launcher has no business defining it). -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+</Project>

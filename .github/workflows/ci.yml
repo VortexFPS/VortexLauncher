@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # Builds on Linux even though the Release config is WinExe: OutputType only selects the PE
+      # subsystem, and nothing here is Windows-only at compile time. The tests are pure logic
+      # (manifest/checksum parsing, install lifecycle with network stubbed via IDownloader).
+      - name: Build
+        run: dotnet build XonoticGodot.Launcher.Tests/XonoticGodot.Launcher.Tests.csproj -c Debug --nologo
+
+      - name: Test
+        run: dotnet test XonoticGodot.Launcher.Tests/XonoticGodot.Launcher.Tests.csproj -c Debug --no-build --nologo
+
+      # Directory.Build.props is load-bearing here: this code was extracted from the game repo and
+      # relies on ImplicitUsings/Nullable that it used to inherit. Losing ImplicitUsings is a hard
+      # build failure so the steps above catch it, but losing Nullable is SILENT - the code compiles
+      # and stops being null-checked. Assert it explicitly rather than trust that nobody trimmed it.
+      - name: Assert the inherited build properties are still set
+        run: |
+          for prop in ImplicitUsings Nullable; do
+            if ! grep -q "<$prop>enable</$prop>" Directory.Build.props; then
+              echo "::error::Directory.Build.props no longer sets $prop=enable. See the README section"
+              echo "::error::'Why Directory.Build.props exists here' before removing it."
+              exit 1
+            fi
+          done
+          echo "ImplicitUsings and Nullable both still enabled"

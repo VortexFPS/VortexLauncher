@@ -1,0 +1,14 @@
+# .NET build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+
+# Velopack packaging output
+pub/
+Releases/
+
+# Local scratch
+_scratch/
