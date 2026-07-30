@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <!-- The host operator's own control plane: dashboard, live console, config editing, build and
+       content management.
+
+       It references Launcher.Protocol and NOTHING ELSE from this repo. No Launcher.Core, by rule and
+       by architecture test. It cannot read the build store, write a server.cfg or spawn a process,
+       because it does not link the code that does any of those things. Every box-touching operation
+       is a protocol message to a runner.
+
+       The cost is a loopback round-trip on some reads. What it buys is that the same-box and
+       cross-box cases are one code path, because no shortcut exists for the same-box case, and that
+       "the runner owns the box" is a compile error rather than a convention. -->
+  <PropertyGroup>
+    <RootNamespace>Launcher.WebServer</RootNamespace>
+    <AssemblyName>Launcher.WebServer</AssemblyName>
+    <UserSecretsId>launcher-webserver</UserSecretsId>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Launcher.Protocol\Launcher.Protocol.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Update="wwwroot\**" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

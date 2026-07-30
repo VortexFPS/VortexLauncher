@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The shared framework: release feeds, build store, install/launch, and (from A2) the instance
+       model, process supervision and game control.
+
+       No UI, no ASP.NET, no third-party packages, and exactly one project reference:
+       Launcher.Protocol. That reference exists so an instance's on-disk instance.json IS the protocol
+       DTO. The alternative was a parallel instance model plus mapping code in every consumer, for no
+       benefit, since Protocol is itself BCL-only and is the leaf of the graph.
+
+       It does not weaken the rule that matters. Launcher.WebServer still must not reference Core, so
+       the control plane still cannot touch the box. Launcher.Tests/ArchitectureTests.cs fails the
+       build if anything else is added here. -->
+  <PropertyGroup>
+    <RootNamespace>Launcher.Core</RootNamespace>
+    <AssemblyName>Launcher.Core</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Launcher.Protocol\Launcher.Protocol.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- xUnit tests for the launcher's pure logic: manifest/checksum parsing, API-fallback synthesis,
+       the install/swap/rollback lifecycle (network stubbed via IDownloader), and the architecture
+       test that enforces the dependency graph.
+
+       References Launcher.Core only. ArchitectureTests reads the .csproj files off disk rather than
+       reflecting over loaded assemblies, so it can police projects this one does not reference
+       (Launcher.WebServer in particular, whose whole point is NOT referencing Core). -->
+  <PropertyGroup>
+    <RootNamespace>Launcher.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Launcher.Core\Launcher.Core.csproj" />
+    <ProjectReference Include="..\..\src\Launcher.WebServer\Launcher.WebServer.csproj" />
+  </ItemGroup>
+</Project>

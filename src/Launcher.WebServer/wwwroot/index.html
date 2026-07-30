@@ -1,0 +1,104 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Vortex Arena server panel</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root { color-scheme: light dark; --fg: #16181d; --bg: #fbfbfc; --muted: #6b7280;
+          --line: #e3e5e9; --warn-bg: #fff4e5; --warn-line: #e0a33c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e6e8ec; --bg: #14161a; --muted: #9aa1ac; --line: #2a2e36;
+            --warn-bg: #33270f; --warn-line: #b3801f; }
+  }
+  body { margin: 0; padding: 2rem 1.5rem; background: var(--bg); color: var(--fg);
+         font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  main { max-width: 60rem; margin: 0 auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 1.5rem; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: .55rem .6rem; border-bottom: 1px solid var(--line); }
+  th { font-weight: 600; color: var(--muted); font-size: .82rem; text-transform: uppercase;
+       letter-spacing: .04em; }
+  .banner { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 6px;
+            padding: .9rem 1rem; margin: .6rem 0 1.2rem; }
+  .banner h2 { font-size: .95rem; margin: 0 0 .4rem; }
+  .banner p { margin: .35rem 0; font-size: .9rem; }
+  button { font: inherit; padding: .35rem .7rem; border: 1px solid var(--line);
+           border-radius: 5px; background: transparent; color: inherit; cursor: pointer; }
+  code { font: 13px ui-monospace, SFMono-Regular, monospace; }
+  .muted { color: var(--muted); }
+</style>
+
+<main>
+  <h1>Vortex Arena server panel</h1>
+  <div id="content" class="muted">Loading…</div>
+</main>
+
+<script type="module">
+  // Thin client of the runner API by design: anything this page can do, `vortex` and Conductor can
+  // do, because all three go through the same protocol to the same runner.
+  const token = new URLSearchParams(location.search).get("token") ?? "";
+  const headers = { "Authorization": `Bearer ${token}` };
+
+  async function api(path, init = {}) {
+    const res = await fetch(path, { ...init, headers: { ...headers, ...(init.headers ?? {}) } });
+    return { status: res.status, body: await res.json().catch(() => null) };
+  }
+
+  function banner(instance) {
+    const since = instance.controlled_since
+      ? new Date(instance.controlled_since).toLocaleDateString() : "an unknown date";
+    return `
+      <div class="banner">
+        <h2>${instance.name} is controlled by the official orchestration layer</h2>
+        <p>Under control by <code>${instance.controller_url ?? "an orchestrator"}</code> since ${since}.
+           Granted scopes: <code>${(instance.granted_scopes ?? []).join(", ") || "none"}</code>.</p>
+        <p>While a server is orchestrated it is configured and operated centrally. You keep full read
+           access, including server logs and player chat, and you can take it back at any time.</p>
+        <p><button data-release="${instance.name}">Return to local control</button>
+           <button data-stop="${instance.name}">Shut down</button></p>
+        <p class="muted">Returning control waits for the current match to end by default. Both actions
+           notify the orchestrator.</p>
+      </div>`;
+  }
+
+  function row(s) {
+    const players = s.players == null ? "—" : `${s.players} + ${s.bots ?? 0} bots / ${s.max_players}`;
+    return `<tr><td><strong>${s.name}</strong></td><td>${s.state}</td><td>${s.map ?? "—"}</td>
+            <td>${players}</td><td>${s.control_mode}</td></tr>`;
+  }
+
+  async function render() {
+    const { status, body } = await api("/api/v1/status");
+    const el = document.getElementById("content");
+
+    if (status === 503) {
+      el.innerHTML = `<p class="muted">No runner is linked. Start one with
+        <code>vortex runner run</code>.</p>`;
+      return;
+    }
+
+    const instances = body?.instances ?? [];
+    const orchestrated = instances.filter(i => i.control_mode === "orchestrated");
+
+    el.innerHTML =
+      orchestrated.map(i => banner({ ...i, controller_url: body.conductor_url })).join("") +
+      `<table><thead><tr><th>Instance</th><th>State</th><th>Map</th><th>Players</th>
+       <th>Control</th></tr></thead><tbody>${instances.map(row).join("")}</tbody></table>`;
+
+    el.querySelectorAll("[data-release]").forEach(b => b.onclick = async () => {
+      await api(`/api/v1/instances/${b.dataset.release}/release`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ when: "end_of_match" }),
+      });
+      render();
+    });
+
+    el.querySelectorAll("[data-stop]").forEach(b => b.onclick = async () => {
+      await api(`/api/v1/instances/${b.dataset.stop}/stop`, { method: "POST" });
+      render();
+    });
+  }
+
+  render();
+  setInterval(render, 5000);
+</script>

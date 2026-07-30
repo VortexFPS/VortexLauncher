@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The Avalonia player launcher (ADR-0015): install, update, launch, and Velopack self-update of
+       the launcher itself. Game installs are launcher-managed plain zips from GitHub Releases.
+
+       Velopack lives HERE and not in Launcher.Core: self-updating is a Desktop concern, and Core is
+       BCL-only by the dependency rule. That is why SelfUpdateService.cs sits in this project even
+       though the rest of the ADR-0015 code moved to Core. -->
+  <PropertyGroup>
+    <!-- Console subsystem for Debug so the smoke-mode flag prints to the terminal; windowed for Release. -->
+    <OutputType Condition="'$(Configuration)' == 'Release'">WinExe</OutputType>
+    <OutputType Condition="'$(Configuration)' != 'Release'">Exe</OutputType>
+    <RootNamespace>Launcher.Desktop</RootNamespace>
+    <AssemblyName>VortexLauncher</AssemblyName>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.3.18" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.3.18" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.18" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.18" />
+    <PackageReference Include="Avalonia.Diagnostics" Version="11.3.18" Condition="'$(Configuration)' == 'Debug'" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+    <PackageReference Include="Velopack" Version="1.2.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Launcher.Core\Launcher.Core.csproj" />
+  </ItemGroup>
+</Project>

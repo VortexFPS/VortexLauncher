@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The management protocol: what a control plane may ask a runner to do, and what a runner reports
+       back. Generated from protocol/ and published as a NuGet package.
+
+       This is the one real package boundary in the repo. Launcher.WebServer and Conductor are peers,
+       both coding against THIS and neither against Launcher.Core, which is what keeps them two
+       consumers of one protocol rather than two management implementations. BCL only, and no project
+       reference: a package that dragged the build store into Conductor's build would defeat the
+       point. -->
+  <PropertyGroup>
+    <RootNamespace>Launcher.Protocol</RootNamespace>
+    <AssemblyName>Launcher.Protocol</AssemblyName>
+    <PackageId>Launcher.Protocol</PackageId>
+    <Description>Runner management protocol for Vortex Arena dedicated servers: instance DTOs, command envelope, control modes and control events.</Description>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+</Project>

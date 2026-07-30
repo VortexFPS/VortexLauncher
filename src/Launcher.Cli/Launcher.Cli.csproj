@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- `vortex`: the scriptable face of Launcher.Core, and the runner daemon.
+       One binary, two roles. Typing `vortex server start x` and running `vortex runner run` under a
+       systemd unit are the same executable; a separate runner project would have been a Program.cs
+       and hosting glue over code this project already links.
+
+       It is also the integration-test surface for Core: every verb takes a json flag and returns a
+       meaningful exit code, so CI can drive the whole install and supervise lifecycle from a shell. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Launcher.Cli</RootNamespace>
+    <AssemblyName>vortex</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.CommandLine" Version="2.0.10" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Launcher.Core\Launcher.Core.csproj" />
+    <ProjectReference Include="..\Launcher.Protocol\Launcher.Protocol.csproj" />
+  </ItemGroup>
+</Project>

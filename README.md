@@ -12,25 +12,43 @@ the game's build.
 ## Run (dev)
 
 ```bash
-dotnet run --project XonoticGodot.Launcher                 # the UI
-dotnet run --project XonoticGodot.Launcher -- --smoke      # headless feed/paths check
-dotnet test XonoticGodot.Launcher.Tests                    # unit tests
+dotnet build VortexLauncher.sln                            # everything
+dotnet run --project src/Launcher.Desktop                  # the UI
+dotnet run --project src/Launcher.Desktop -- --smoke       # headless feed/paths check
+dotnet test VortexLauncher.sln                             # unit tests
 ```
 
 Dev builds are NOT Velopack-installed, so self-update is inert (`UpdateManager.IsInstalled`
 guard) — everything else works, including real game installs into
-`%LOCALAPPDATA%/XonoticGodot/Launcher` (`~/.local/share/…` on Linux).
+`%LOCALAPPDATA%/VortexArena/Launcher` (`~/.local/share/…` on Linux).
+
+## Layout
+
+```
+src/Launcher.Core/       the shared framework, BCL only
+src/Launcher.Desktop/    the Avalonia player launcher
+tests/Launcher.Tests/    unit tests + the architecture test
+planning/                design docs for the launcher, Conductor, and the roadmap
+```
+
+`Launcher.Cli` (the `vortex` binary, which is also the runner daemon) and `Launcher.WebServer` land in
+A1 and A4. The dependency graph they all have to satisfy is in
+[planning/launcher-host-agent-plan.md](planning/launcher-host-agent-plan.md) §2 and is enforced by
+`tests/Launcher.Tests/ArchitectureTests.cs`, which reads the `.csproj` files directly. The rule that
+matters: `Launcher.WebServer` must never reference `Launcher.Core`, so the control plane physically
+cannot touch the box and every operation goes to a runner over the protocol.
 
 ## Map
 
 | Piece | File | Job |
 |---|---|---|
-| Feeds | `Core/ReleaseFeeds.cs` | `latest.json` via `/releases/latest/download` (no API quota) → GitHub API fallback (sees prereleases) |
-| Manifest | `Core/Manifest.cs` | `latest.json` model (emitted by `tools/make-manifest.py` **in the game repo's** release job) |
-| Download | `Core/DownloadService.cs` | resumable (Range), sha256-verified — refuses checksum-less files |
-| Install | `Core/InstallService.cs` | staging extract → atomic move → `current.json` flip; keeps N-1 for rollback; shared content-addressed asset store for `-core` installs |
-| Launch | `Core/GameLauncher.cs` | spawns the game; `--data <store>` for core installs (fat installs self-resolve) |
-| Self-update | `Core/SelfUpdateService.cs` | Velopack against this repo's releases |
+| Feeds | `src/Launcher.Core/ReleaseFeeds.cs` | `latest.json` via `/releases/latest/download` (no API quota) → GitHub API fallback (sees prereleases) |
+| Manifest | `src/Launcher.Core/Manifest.cs` | `latest.json` model (emitted by `tools/make-manifest.py` **in the game repo's** release job) |
+| Download | `src/Launcher.Core/DownloadService.cs` | resumable (Range), sha256-verified — refuses checksum-less files |
+| Install | `src/Launcher.Core/InstallService.cs` | staging extract → atomic move → `current.json` flip; keeps N-1 for rollback; shared content-addressed asset store for `-core` installs |
+| Launch | `src/Launcher.Core/GameLauncher.cs` | spawns the game; `--data <store>` for core installs (fat installs self-resolve) |
+| Artifact names | `src/Launcher.Core/LauncherConfig.cs` | the accepted release-artifact prefixes; see the rename note below |
+| Self-update | `src/Launcher.Desktop/SelfUpdateService.cs` | Velopack against this repo's releases |
 
 Invariants (ADR-0015 §6): never gate Play on the network; verify before swap; resume
 interrupted downloads; keep the previous version.
@@ -50,10 +68,13 @@ Two consequences worth knowing before touching either side:
   back to `GitHubApiFeed`, which is unauthenticated GitHub API at 60 req/hr. That degrades quietly —
   the launcher keeps working, just on a rate-limited path. Anything else published to the game repo's
   releases (an engine template, for instance) must be marked `prerelease`.
-- **The artifact rename breaks update continuity.** When the game's artifacts go `XonoticGodot-*` →
-  `VortexArena-*` (restructure stage 5, item 35), existing installs do not follow. That first
-  `VortexArena`-named release is a deliberate cutover and needs documenting here and in the game's
-  `docs/RELEASING.md` *before* the tag is pushed.
+- **The artifact rename is handled, but only because both names are accepted.** The game's artifacts go
+  `XonoticGodot-*` → `VortexArena-*` when the rebrand reaches `tools/package.sh`. Rather than pick a
+  side, `LauncherConfig.ArtifactPrefixes` lists both (newest first) and every consumer tries each:
+  zip-name parsing, the assets-pack regex, and the binary probe in `GameLauncher`. A launcher built
+  before the cutover can install a release published after it, and an install made under the old name
+  keeps launching. Drop `XonoticGodot` from that list only when no supported install can still carry
+  it. The cutover release is still worth a line in the game's `docs/RELEASING.md`.
 
 ## Why `Directory.Build.props` exists here
 
@@ -68,17 +89,24 @@ checked. See the comments in that file.
 
 ## Naming
 
-Projects and assemblies still carry the `XonoticGodot` codename, matching the game repo, which has not
-run its Tier-1 rename yet. Renaming here is cheap — no published releases, no consumers — but it
-should land as its own commit, after the game's rename, so the two agree.
+Projects, namespaces and assemblies are renamed: `Launcher.Core`, `Launcher.Desktop`, `Launcher.Tests`,
+and `VortexLauncher.exe`. That was safe to do independently because nothing consumes them yet.
+
+The game's *artifact* names are a separate question with a separate answer, because the launcher does
+not own them and has to read whatever the release job uploaded. See the rename bullet above.
+
+The launcher's data root moved with the rename, from `%LOCALAPPDATA%/XonoticGodot/Launcher` to
+`%LOCALAPPDATA%/VortexArena/Launcher`. No migration exists and none is needed: the only published
+release carries a `SHA256SUMS` file and no platform zips, so no machine can be holding an install under
+the old root.
 
 ## Packaging the launcher itself (deferred — ADR-0015 §7)
 
 Velopack packages, not yet wired into a workflow:
 
 ```bash
-dotnet publish XonoticGodot.Launcher -c Release -r win-x64 --self-contained -o pub
-vpk pack -u XonoticGodotLauncher -v <ver> -p pub -e XonoticGodotLauncher.exe
+dotnet publish src/Launcher.Desktop -c Release -r win-x64 --self-contained -o pub
+vpk pack -u VortexLauncher -v <ver> -p pub -e VortexLauncher.exe
 ```
 
 ## Known prototype gaps

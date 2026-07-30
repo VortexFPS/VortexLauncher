@@ -18,14 +18,14 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      # Builds on Linux even though the Release config is WinExe: OutputType only selects the PE
+      # Builds on Linux even though Launcher.Desktop's Release config is WinExe: OutputType only selects the PE
       # subsystem, and nothing here is Windows-only at compile time. The tests are pure logic
       # (manifest/checksum parsing, install lifecycle with network stubbed via IDownloader).
       - name: Build
-        run: dotnet build XonoticGodot.Launcher.Tests/XonoticGodot.Launcher.Tests.csproj -c Debug --nologo
+        run: dotnet build VortexLauncher.sln -c Debug --nologo
 
       - name: Test
-        run: dotnet test XonoticGodot.Launcher.Tests/XonoticGodot.Launcher.Tests.csproj -c Debug --no-build --nologo
+        run: dotnet test VortexLauncher.sln -c Debug --no-build --nologo
 
       # Directory.Build.props is load-bearing here: this code was extracted from the game repo and
       # relies on ImplicitUsings/Nullable that it used to inherit. Losing ImplicitUsings is a hard
