@@ -191,6 +191,7 @@ public sealed partial class SourceProvider(LauncherPaths paths, BuildStore build
 
     /// <summary>Zip extraction does not restore the +x bit, so a freshly extracted Godot will not
     /// run on Linux or macOS without this.</summary>
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")] // callers guard on IsWindows()
     private static void MarkExecutables(string directory)
     {
         foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))

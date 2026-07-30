@@ -19,6 +19,7 @@ public static class RunnerCommands
         runner.Subcommands.Add(Status(jsonOption, rootOption));
         runner.Subcommands.Add(Link(jsonOption, rootOption));
         runner.Subcommands.Add(Unlink(jsonOption, rootOption));
+        runner.Subcommands.Add(RotateKey(jsonOption, rootOption));
         runner.Subcommands.Add(InstallService(jsonOption, rootOption));
         root.Subcommands.Add(runner);
     }
@@ -235,6 +236,81 @@ public static class RunnerCommands
                       string.Join(", ", stillOrchestrated) +
                       $"{Environment.NewLine}Release each with `vortex server release <name>` so the " +
                       "orchestrator gets an alert with the player count.");
+        });
+
+        return command;
+    }
+
+    private static Command RotateKey(Option<bool> jsonOption, Option<string?> rootOption)
+    {
+        var command = new Command("rotate-key", "replace this box's orchestration identity key");
+
+        command.SetAction(async (parse, ct) =>
+        {
+            var output = new Output(parse.GetValue(jsonOption));
+            var paths = new LauncherPaths(parse.GetValue(rootOption));
+            var runnerId = RunnerIdentity.LoadOrCreate(paths);
+            var configStore = new RunnerConfigStore(paths);
+            var config = configStore.Load();
+
+            if (config.ConductorUrl is null)
+                return output.Fail("not_linked",
+                    "this runner is not linked; `vortex runner link` creates the first key",
+                    ExitCodes.Conflict);
+
+            // The new key is signed by the old one, which is what proves continuity. The old key
+            // stays this runner's identity until the plane has accepted the new one, so a rotation
+            // that fails partway leaves the box able to authenticate with what it had.
+            RunnerConfigStore.RotationRequest rotation;
+            try
+            {
+                rotation = configStore.BeginRotation();
+            }
+            catch (InvalidOperationException ex)
+            {
+                return output.Fail("no_key", ex.Message, ExitCodes.Conflict);
+            }
+
+            try
+            {
+                using var http = LauncherHttp.Create();
+                var url = $"{config.ConductorUrl.TrimEnd('/')}" +
+                          $"/api/v1/adoption/runners/{runnerId}/rotate-key";
+
+                using var response = await http.PostAsync(url, new StringContent(
+                    ManagementProtocol.Serialize(new
+                    {
+                        new_public_key_pem = rotation.NewPublicKeyPem,
+                        signature_by_current_key = rotation.SignatureByCurrentKey,
+                    }), System.Text.Encoding.UTF8, "application/json"), ct);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    configStore.AbandonRotation();
+                    return output.Fail("rotation_refused",
+                        $"{config.ConductorUrl} refused the new key " +
+                        $"({(int)response.StatusCode}); the existing key is unchanged",
+                        ExitCodes.Error);
+                }
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+            {
+                configStore.AbandonRotation();
+                return output.Fail("conductor_unreachable",
+                    $"could not reach {config.ConductorUrl} ({ex.Message}); " +
+                    "the existing key is unchanged", ExitCodes.Unavailable);
+            }
+
+            configStore.CommitRotation();
+            configStore.Save(config with { ControlKeyFingerprint = rotation.NewFingerprint });
+
+            return output.Ok(new { control_key_fingerprint = rotation.NewFingerprint },
+                $"""
+                 rotated. new fingerprint: {rotation.NewFingerprint}
+
+                 Running servers keep announcing the old fingerprint until they restart. The
+                 orchestrator already knows both, so nothing is interrupted.
+                 """);
         });
 
         return command;

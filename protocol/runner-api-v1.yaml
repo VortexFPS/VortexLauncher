@@ -1,0 +1,473 @@
+openapi: 3.1.0
+
+info:
+  title: Vortex Arena runner management API
+  version: "1.0.0"
+  description: |
+    What a control plane may ask a runner to do, and what a runner reports back.
+
+    This is the contract, not a description of an implementation. Two planes code against it:
+    `Launcher.WebServer`, which the host owner runs, and Conductor, which operates adopted servers.
+    They are peers over one protocol rather than two management implementations, which is why adding
+    a verb here gives both of them the feature with no further protocol work.
+
+    The same operations travel two ways. Over HTTP a plane serves them to a browser; over the runner
+    link they are tunneled inside a `CommandEnvelope` carrying this method, this path and this body.
+    A runner implements them once, in `CommandDispatcher`.
+
+servers:
+  - url: http://127.0.0.1:7777
+    description: A control plane on the same box. The default, and the only binding that needs no TLS.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: instances
+  - name: control-modes
+    description: |
+      An instance is `local` or `orchestrated`, never both and never a merged permission set. The
+      runner arbitrates by the origin of the request and rejects the other plane outright, which is
+      what stops two planes racing on one instance.
+  - name: builds
+  - name: content
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness
+      security: []
+      description: The only unauthenticated endpoint. Everything else carries a bearer token,
+        including the WebSocket upgrade.
+      responses:
+        "200": { description: The plane is up }
+
+  /api/v1/runner/status:
+    get:
+      tags: [instances]
+      summary: Runner identity, resources and every instance it owns
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunnerStatus" }
+
+  /api/v1/instances:
+    get:
+      tags: [instances]
+      summary: List instances
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/InstanceStatus" }
+    post:
+      tags: [instances]
+      summary: Create an instance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InstanceSpec" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstanceSpec" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/instances/{name}:
+    parameters:
+      - $ref: "#/components/parameters/InstanceName"
+    get:
+      tags: [instances]
+      summary: Read an instance's configuration
+      description: Allowed while orchestrated. The host owner keeps every read.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstanceSpec" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [instances]
+      summary: Update an instance's configuration
+      description: |
+        Control fields are runner state and are ignored here. Accepting `control_mode`,
+        `controller_url`, `granted_scopes` or `controlled_since` from a spec edit would let a PATCH
+        hand the box to an orchestrator, or take it back without the release path that raises the
+        alert.
+
+        Setting `content_set` makes the runner fetch what it is missing. A package that fails to
+        arrive or fails validation leaves the instance on its previous set rather than half applied.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InstanceSpec" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstanceSpec" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Orchestrated" }
+    delete:
+      tags: [instances]
+      summary: Delete a stopped instance and its data
+      responses:
+        "204": { description: Deleted }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/instances/{name}/status:
+    parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+    get:
+      tags: [instances]
+      summary: Supervisor state plus a live getinfo snapshot
+      description: |
+        `players` is null when the server has not answered a probe, which is a different thing from
+        answering with zero. A process that is alive but silent is not a running server.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstanceStatus" }
+
+  /api/v1/instances/{name}/logs:
+    parameters:
+      - $ref: "#/components/parameters/InstanceName"
+      - name: tail
+        in: query
+        schema: { type: integer, default: 500 }
+    get:
+      tags: [instances]
+      summary: Recent output
+      description: |
+        Includes parsed eventlog lines. Chat is flagged with `is_chat`, and a plane without the
+        `chat-read` scope must drop those before forwarding: reading player chat on somebody's
+        community server is a privacy-relevant grant that does not ride along with operating it.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/LogLine" }
+
+  /api/v1/instances/{name}/audit:
+    parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+    get:
+      tags: [control-modes]
+      summary: What was done to this instance, and by whom
+      description: |
+        The runner records this independently of any control plane. That is what lets a host owner
+        see what an orchestrator did to their box, rather than taking the orchestrator's word for it.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { type: string } }
+
+  /api/v1/instances/{name}/start:
+    parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+    post:
+      tags: [instances]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/InstanceStatus" } } } }
+        "409": { $ref: "#/components/responses/Orchestrated" }
+
+  /api/v1/instances/{name}/restart:
+    parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+    post:
+      tags: [instances]
+      responses:
+        "200": { description: OK }
+        "409": { $ref: "#/components/responses/Orchestrated" }
+
+  /api/v1/instances/{name}/stop:
+    parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+    post:
+      tags: [control-modes]
+      summary: Stop an instance
+      description: |
+        One of the host owner's two exits, and available to them whatever the control mode: it is
+        their hardware. On an orchestrated instance the runner emits a control event first and waits
+        briefly for an ack, then proceeds regardless.
+      responses:
+        "200": { description: OK }
+
+  /api/v1/instances/{name}/drain:
+    parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+    post:
+      tags: [instances]
+      summary: Warn players, wait for the server to empty, then stop
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                message: { type: string }
+                timeout_seconds: { type: integer, default: 300 }
+      responses:
+        "200": { description: OK }
+        "409": { $ref: "#/components/responses/Orchestrated" }
+
+  /api/v1/instances/{name}/exec:
+    parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+    post:
+      tags: [instances]
+      summary: Run a console command
+      description: |
+        Delivered over the child's stdin when the runner owns it, and over loopback srcon otherwise
+        (an adopted orphan whose stdin died with the previous runner). A command containing a control
+        character or a semicolon is refused: the game refuses it too, even with a valid password.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command: { type: string }
+      responses:
+        "200": { description: Sent }
+        "409": { $ref: "#/components/responses/Orchestrated" }
+
+  /api/v1/instances/{name}/release:
+    parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+    post:
+      tags: [control-modes]
+      summary: Return an orchestrated instance to local control
+      description: |
+        The other of the host owner's two exits, and the one route deliberately not gated on control
+        mode.
+
+        `end_of_match` is the default because most releases are an operator wanting their box back
+        rather than an emergency, and a one-click graceful option is what keeps the critical-alert
+        queue worth reading. `now` is always available and gated on nothing, including on the
+        orchestrator being reachable.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                when: { type: string, enum: [end_of_match, now], default: end_of_match }
+                reason:
+                  type: string
+                  description: Attached to the alert. Worth reading before treating a mid-match
+                    release as a problem.
+      responses:
+        "200":
+          description: Released, or scheduled for the end of the current match
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstanceSpec" }
+
+  /api/v1/builds:
+    get:
+      tags: [builds]
+      summary: Installed builds
+      description: A build is the unit both providers produce, so a downloaded release and a locally
+        compiled one pin, update and roll back identically.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/BuildSummary" } }
+
+  /api/v1/content:
+    get:
+      tags: [content]
+      summary: The content packages this runner has cached
+      responses:
+        "200": { description: OK }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Generated at `vortex runner install-service`, shown once, stored hashed.
+
+  parameters:
+    InstanceName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,64}$" }
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content: { application/json: { schema: { $ref: "#/components/schemas/ApiError" } } }
+    NotFound:
+      description: No such instance
+      content: { application/json: { schema: { $ref: "#/components/schemas/ApiError" } } }
+    Conflict:
+      description: Refused in the current state
+      content: { application/json: { schema: { $ref: "#/components/schemas/ApiError" } } }
+    Orchestrated:
+      description: |
+        The instance is under orchestrator control, so this mutating call is refused. The body names
+        the controlling plane and both exits, which is what lets a UI render the banner and its two
+        buttons without special-casing every endpoint that can produce this.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+          example:
+            code: instance_orchestrated
+            message: "instance 'eu-1' is controlled by https://conductor.vortexfps.org"
+            orchestrated:
+              controller_url: https://conductor.vortexfps.org
+              controlled_since: "2026-07-30T18:00:00Z"
+              granted_scopes: [view, control-instances, moderate]
+              release_path: release
+              stop_path: stop
+
+  schemas:
+    InstanceSpec:
+      type: object
+      required: [name, map, port]
+      properties:
+        name: { type: string }
+        map: { type: string }
+        gametype: { type: string, default: dm }
+        port:
+          type: integer
+          description: Always explicit. The runner reads the real bind line out of stdout before
+            reporting the instance running, because a process that started is not a server that bound.
+        max_players: { type: integer, default: 16 }
+        hostname: { type: string }
+        build_id: { type: string, nullable: true }
+        restart_policy: { type: string, enum: [always, on_failure, never], default: on_failure }
+        restart_at:
+          type: string
+          nullable: true
+          description: Unattended restart window as HH:mm in the box's local time. Local rather than
+            UTC because an operator picking 05:00 means their quiet hour.
+        restart_only_when_empty: { type: boolean, default: true }
+        extra_args: { type: array, items: { type: string } }
+        environment: { type: object, additionalProperties: { type: string } }
+        content_set:
+          type: array
+          items: { type: string, pattern: "^[0-9a-f]{64}$" }
+          description: sha256 of each package. The runner fetches what it is missing and verifies
+            before installing; nothing is ever pushed at it.
+        control_mode: { type: string, enum: [local, orchestrated], readOnly: true }
+        controller_url: { type: string, nullable: true, readOnly: true }
+        granted_scopes: { type: array, items: { type: string }, readOnly: true }
+        controlled_since: { type: string, format: date-time, nullable: true, readOnly: true }
+
+    InstanceStatus:
+      type: object
+      properties:
+        name: { type: string }
+        state: { type: string, enum: [stopped, starting, running, draining, stopping, flapping, failed] }
+        control_mode: { type: string, enum: [local, orchestrated] }
+        build_id: { type: string, nullable: true }
+        pid: { type: integer, nullable: true }
+        started_at: { type: string, format: date-time, nullable: true }
+        map: { type: string, nullable: true }
+        gametype: { type: string, nullable: true }
+        players:
+          type: integer
+          nullable: true
+          description: Humans only, excluding bots. Null means the server has not answered a probe.
+        bots: { type: integer, nullable: true }
+        max_players: { type: integer, nullable: true }
+        match_live: { type: boolean }
+        match_elapsed_seconds: { type: integer, nullable: true }
+        cpu_percent:
+          type: number
+          nullable: true
+          description: Share of the whole machine, divided by core count, so two boxes are comparable.
+        memory_bytes: { type: integer, nullable: true }
+        restart_count: { type: integer }
+        last_exit_reason: { type: string, nullable: true }
+
+    RunnerStatus:
+      type: object
+      properties:
+        runner_id: { type: string }
+        version: { type: string }
+        platform: { type: string }
+        hostname: { type: string }
+        started_at: { type: string, format: date-time }
+        disk_free_bytes: { type: integer, nullable: true }
+        cpu_percent: { type: number, nullable: true }
+        memory_total_bytes: { type: integer, nullable: true }
+        memory_used_bytes: { type: integer, nullable: true }
+        conductor_url:
+          type: string
+          nullable: true
+          description: Set when this runner is linked, whatever any single instance's mode is. A
+            linked runner with every instance local is a normal state.
+        instances: { type: array, items: { $ref: "#/components/schemas/InstanceStatus" } }
+
+    LogLine:
+      type: object
+      properties:
+        instance_name: { type: string }
+        stream: { type: string, enum: [stdout, stderr, event, runner] }
+        text: { type: string }
+        timestamp: { type: string, format: date-time }
+        event_type: { type: string, nullable: true }
+        is_chat:
+          type: boolean
+          description: True for chat, chat_team, chat_spec and chat_minigame. A plane without
+            chat-read filters on this.
+
+    BuildSummary:
+      type: object
+      properties:
+        id: { type: string, description: "A version, or source:{ref}@{sha7}" }
+        version: { type: string }
+        provider: { type: string, enum: [release, source] }
+        platform_key: { type: string }
+        layout: { type: string, enum: [fat, core], nullable: true }
+        size_bytes: { type: integer }
+        installed_at: { type: string, format: date-time }
+        in_use: { type: boolean }
+
+    ApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - instance_orchestrated
+            - instance_not_found
+            - instance_exists
+            - instance_running
+            - build_not_found
+            - content_not_found
+            - content_invalid
+            - port_unavailable
+            - scope_denied
+            - unauthorized
+            - invalid_request
+        message: { type: string }
+        orchestrated:
+          type: object
+          nullable: true
+          properties:
+            controller_url: { type: string }
+            controlled_since: { type: string, format: date-time, nullable: true }
+            granted_scopes: { type: array, items: { type: string } }
+            release_path: { type: string, default: release }
+            stop_path: { type: string, default: stop }

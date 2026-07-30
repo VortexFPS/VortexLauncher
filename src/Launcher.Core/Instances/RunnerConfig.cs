@@ -1,3 +1,4 @@
+using System.Text;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Launcher.Protocol;
@@ -104,6 +105,66 @@ public sealed class RunnerConfigStore(LauncherPaths paths)
     }
 
     public string PublicKeyPem() => File.ReadAllText(PublicKeyPath);
+
+    /// <summary>Replace this box's identity key, proving continuity by signing the new public key
+    /// with the old private one.
+    ///
+    /// That signature is what makes rotation safe without re-adoption. A Conductor holding the old
+    /// public key can check that whoever is presenting a new key is the same box it already
+    /// accepted, so there is no window where the server is unmanaged and no second trip through the
+    /// adoption queue. An attacker who has neither key cannot produce it.
+    ///
+    /// The old key is kept until <see cref="CommitRotation"/>, so a rotation that fails partway
+    /// leaves the runner able to authenticate with what it had.</summary>
+    public RotationRequest BeginRotation()
+    {
+        if (!File.Exists(PrivateKeyPath))
+            throw new InvalidOperationException(
+                "this runner has no identity key; `vortex runner link` creates one");
+
+        using var replacement = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var newPublicPem = replacement.ExportSubjectPublicKeyInfoPem();
+
+        using var current = LoadKey();
+        var signature = current.SignData(
+            Encoding.UTF8.GetBytes(newPublicPem), HashAlgorithmName.SHA256);
+
+        File.WriteAllText(PendingPrivateKeyPath, replacement.ExportECPrivateKeyPem());
+        RestrictToOwner(PendingPrivateKeyPath);
+
+        var fingerprint = Convert.ToHexString(
+            SHA256.HashData(replacement.ExportSubjectPublicKeyInfo())).ToLowerInvariant();
+
+        return new RotationRequest(fingerprint, newPublicPem, Convert.ToBase64String(signature));
+    }
+
+    /// <summary>Promote the pending key once the control plane has accepted it. Only then does the
+    /// old key stop being this runner's identity.</summary>
+    public void CommitRotation()
+    {
+        if (!File.Exists(PendingPrivateKeyPath))
+            throw new InvalidOperationException("no rotation is in progress");
+
+        using var replacement = ECDsa.Create();
+        replacement.ImportFromPem(File.ReadAllText(PendingPrivateKeyPath));
+
+        File.WriteAllText(PrivateKeyPath, replacement.ExportECPrivateKeyPem());
+        File.WriteAllText(PublicKeyPath, replacement.ExportSubjectPublicKeyInfoPem());
+        RestrictToOwner(PrivateKeyPath);
+        File.Delete(PendingPrivateKeyPath);
+    }
+
+    public void AbandonRotation()
+    {
+        if (File.Exists(PendingPrivateKeyPath))
+            File.Delete(PendingPrivateKeyPath);
+    }
+
+    private string PendingPrivateKeyPath => Path.Combine(paths.RunnerDir, "control-key.pending.pem");
+
+    /// <summary>What the runner sends to have a new key accepted.</summary>
+    public sealed record RotationRequest(
+        string NewFingerprint, string NewPublicKeyPem, string SignatureByCurrentKey);
 
     public void DeleteKeyPair()
     {

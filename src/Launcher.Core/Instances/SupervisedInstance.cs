@@ -92,7 +92,12 @@ public sealed class SupervisedInstance : IDisposable
 
     // ---- lifecycle ----
 
+    /// <summary>Start the process. Async in signature only: spawning is synchronous, and the pumps it
+    /// kicks off are deliberately not awaited here because they run for the life of the server. Kept
+    /// async so callers do not have to change if starting ever needs to wait for something.</summary>
+#pragma warning disable CS1998
     public async Task StartAsync(CancellationToken ct = default)
+#pragma warning restore CS1998
     {
         if (State is InstanceState.Running or InstanceState.Starting)
             return;
