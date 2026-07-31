@@ -177,10 +177,20 @@ instead of committed because another agent had eight worktrees open on `feature/
 driving `Tick()` from wherever the dpmaster heartbeat is driven, and sourcing the menu browser from
 `GET /api/v1/servers`. The classic dpmaster lane is untouched.
 
-**EXT-2. Deploy Conductor to OVH.** `deploy/` builds and composes; nothing has ever run. This needs a
-host, TLS termination in front (the app returns a hard 426 on plaintext rather than redirecting, so an
-announce client never learns that http works), DNS for both hostnames, a CDN over the browse endpoint and
-`/content`, and someone to own the box. Who operates it is still an open question, not a technical one.
+**EXT-2. Deploy Conductor.** `deploy/` builds and composes; nothing has ever run.
+
+Where it runs, on what, and who owns the box are infrastructure questions, and they are answered in the
+NetworkOps repo rather than here: `runbooks/deploy-conductor-ovh.md` for the procedure and the
+host choice, `runbooks/deploy-conductor-ovh-tests.md` for the acceptance tests, and
+`runbooks/conductor-load-test.js` for load. This repo deliberately does not describe a host. A
+deployment detail written down in two places is a deployment detail that is wrong in one of them, and
+the copy in the application repo is the one nobody updates.
+
+What belongs here is only what the *code* requires of any host: TLS terminated in front, since the app
+answers a hard 426 on plaintext rather than redirecting and an announce client must never learn that
+http works; and unfiltered outbound UDP with the replies reaching the same ephemeral socket, because
+the challenge verifier is what decides whether anything is ever listed. Lose the second and every
+announce still returns 200, `/healthz` stays green, and the server list stays empty.
 
 **EXT-3. Security review, deferred to post-beta.** A pen test against both protocols, plus key rotation
 practice for Conductor's own keys and whatever multi-region story the master needs. Deferred on purpose:
