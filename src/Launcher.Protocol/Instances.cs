@@ -50,6 +50,16 @@ public sealed record InstanceSpec
     public int MaxPlayers { get; init; } = 16;
     public string? Hostname { get; init; }
 
+    /// <summary>Announce this instance to the master, so players can find it in the server browser.
+    ///
+    /// On by default, which is the opposite of the game's own default, and deliberately so. The game
+    /// leaves sv_public unregistered at 0 to protect a listen server that never asked to be public;
+    /// an instance somebody created with `vortex server create` on a box running a supervisor did ask,
+    /// by existing. False is the per-instance opt out: a scrim server or a staging box that should not
+    /// appear in a public list. The runner honours it by pinning sv_public at launch, so an unlisted
+    /// instance sends no announce at all rather than asking the master not to list it.</summary>
+    public bool Listed { get; init; } = true;
+
     /// <summary>Build id this instance runs. Null means "whatever the store considers current",
     /// resolved at start and then recorded, so a restart cannot silently change versions.</summary>
     public string? BuildId { get; init; }

@@ -31,6 +31,13 @@ public sealed record ReleaseManifest
     [JsonIgnore] public string? NotesBody { get; init; }
     [JsonIgnore] public bool Prerelease { get; init; }
 
+    /// <summary>How this manifest fared against the signature policy, in one line fit to show a
+    /// player ("signed by key …", "unsigned (accepted: …)"). A manifest that FAILED verification
+    /// never gets here — the feed throws — so this is a status, not a verdict to branch on. It
+    /// exists so the transition to required signatures is observable from the UI instead of being
+    /// a thing you find out about on flag day.</summary>
+    [JsonIgnore] public string? SignatureStatus { get; init; }
+
     public static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     public static ReleaseManifest? Parse(string json) =>

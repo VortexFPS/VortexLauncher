@@ -1,4 +1,4 @@
-using System.Net.Http.Headers;
+using System.Diagnostics.CodeAnalysis;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Launcher.Core;
@@ -10,11 +10,16 @@ namespace Launcher.Desktop.ViewModels;
 /// never the Play button.</summary>
 public partial class MainWindowViewModel : ObservableObject
 {
-    private readonly CompositeFeed _feed;
-    private readonly InstallService _installs;
-    private readonly GameLauncher _game;
+    private readonly HttpClient _http = LauncherHttp.Create();
     private readonly SelfUpdateService _selfUpdate = new();
     private readonly string _platformKey = PlatformKey.Current;
+    private readonly LauncherSettingsStore _settingsStore = new();
+
+    // All four follow the settings, so they are rebuilt by Bind() and not fixed at construction.
+    private LauncherSettings _settings;
+    private CompositeFeed _feed;
+    private InstallService _installs;
+    private GameLauncher _game;
 
     private ReleaseManifest? _latest;
     private CancellationTokenSource? _installCts;
@@ -22,6 +27,7 @@ public partial class MainWindowViewModel : ObservableObject
     [ObservableProperty] private string _statusText = "Starting…";
     [ObservableProperty] private string _installedText = "not installed";
     [ObservableProperty] private string _latestText = "checking…";
+    [ObservableProperty] private string _channelText = "";
     [ObservableProperty] private string _notesTitle = "Release notes";
     [ObservableProperty] private string _notesText = "";
     [ObservableProperty] private double _progress;
@@ -32,6 +38,7 @@ public partial class MainWindowViewModel : ObservableObject
     [NotifyCanExecuteChangedFor(nameof(UpdateCommand))]
     [NotifyCanExecuteChangedFor(nameof(RefreshCommand))]
     [NotifyCanExecuteChangedFor(nameof(CancelCommand))]
+    [NotifyCanExecuteChangedFor(nameof(OpenSettingsCommand))]
     private bool _busy;
 
     [ObservableProperty]
@@ -42,20 +49,47 @@ public partial class MainWindowViewModel : ObservableObject
     [NotifyCanExecuteChangedFor(nameof(UpdateCommand))]
     private bool _updateAvailable;
 
+    /// <summary>The settings sheet, shown over this screen.</summary>
+    public SettingsViewModel Settings { get; }
+
     public MainWindowViewModel()
     {
-        var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
-        http.DefaultRequestHeaders.UserAgent.ParseAdd(LauncherConfig.UserAgent);
-        http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        _settings = _settingsStore.Load();
+        Bind(_settings);
 
-        var paths = new LauncherPaths();
-        _feed = new CompositeFeed(new ManifestFeed(http), new GitHubApiFeed(http));
-        _installs = new InstallService(paths, new DownloadService(http));
-        _game = new GameLauncher(_installs);
+        Settings = new SettingsViewModel(_settingsStore, _settings);
+        Settings.Applied += OnSettingsApplied;
 
-        Installed = _installs.LoadCurrent();
-        InstalledText = Installed is null ? "not installed" : $"{Installed.Version} ({Installed.Layout})";
+        ShowInstalled(_installs.LoadCurrent());
         _ = InitializeAsync();
+    }
+
+    /// <summary>(Re)build everything the settings decide: which root the installs live under, and
+    /// which feeds the channel asks in which order.</summary>
+    [MemberNotNull(nameof(_installs), nameof(_game), nameof(_feed))]
+    private void Bind(LauncherSettings settings)
+    {
+        _installs = new InstallService(new LauncherPaths(settings.InstallRoot), new DownloadService(_http));
+        _game = new GameLauncher(_installs);
+        _feed = ChannelFeeds.FeedFor(_http, settings.Channel);
+        ChannelText = settings.IsBeta ? "beta — pre-releases included" : "stable";
+    }
+
+    private void OnSettingsApplied(LauncherSettings settings)
+    {
+        _settings = settings;
+        Bind(settings);
+        // The root may have moved, so what counts as installed has to be re-read, not assumed.
+        ShowInstalled(_installs.LoadCurrent());
+        _latest = null;
+        UpdateAvailable = false;
+        _ = RefreshAsync();
+    }
+
+    private void ShowInstalled(InstalledState? state)
+    {
+        Installed = state;
+        InstalledText = state is null ? "not installed" : $"{state.Version} ({state.Layout})";
     }
 
     private async Task InitializeAsync()
@@ -69,6 +103,13 @@ public partial class MainWindowViewModel : ObservableObject
         var msg = await _selfUpdate.CheckAndApplyAsync(CancellationToken.None);
         StatusText = $"{StatusText}  ·  {msg}";
     }
+
+    [RelayCommand(CanExecute = nameof(CanOpenSettings))]
+    private void OpenSettings() => Settings.Open(Installed?.Version);
+
+    /// <summary>Closed mid-install: changing the install root under a running download would strand
+    /// the half-written staging directory at the old root.</summary>
+    private bool CanOpenSettings() => !Busy;
 
     [RelayCommand(CanExecute = nameof(CanRefresh))]
     private async Task RefreshAsync()
@@ -96,6 +137,17 @@ public partial class MainWindowViewModel : ObservableObject
             NotesText = string.IsNullOrWhiteSpace(manifest.NotesBody)
                 ? $"Notes: {manifest.NotesUrl}"
                 : manifest.NotesBody!;
+
+            // The stable channel can still be SHOWN a prerelease: when no full release exists yet, the
+            // API fallback is all there is. Naming it and pointing at the setting beats pretending the
+            // repo is empty (and beats installing it behind the player's back).
+            if (manifest.Prerelease && !_settings.IsBeta)
+            {
+                UpdateAvailable = false;
+                StatusText = $"The newest build, {manifest.Tag}, is a pre-release. "
+                    + "Switch to the beta channel in Settings to install it.";
+                return;
+            }
 
             var plat = manifest.PlatformFor(_platformKey);
             if (plat is null || (plat.Fat is null && plat.Core is null))
@@ -140,11 +192,11 @@ public partial class MainWindowViewModel : ObservableObject
                     : $"{p.Phase} {_latest.Version}…";
             });
             // Prefer the split payload when the release carries it (ADR-0015 §4); fat otherwise.
-            Installed = await _installs.InstallAsync(_latest, _platformKey,
+            var state = await _installs.InstallAsync(_latest, _platformKey,
                 preferCore: true, progress, _installCts.Token);
-            InstalledText = $"{Installed.Version} ({Installed.Layout})";
+            ShowInstalled(state);
             UpdateAvailable = false;
-            StatusText = $"Installed {Installed.Version} — ready to play.";
+            StatusText = $"Installed {state.Version} — ready to play.";
         }
         catch (OperationCanceledException)
         {

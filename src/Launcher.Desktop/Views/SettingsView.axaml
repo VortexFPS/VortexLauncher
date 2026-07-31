@@ -1,0 +1,68 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Launcher.Desktop.ViewModels"
+             x:Class="Launcher.Desktop.Views.SettingsView"
+             x:DataType="vm:SettingsViewModel">
+
+  <Border Background="#161b26" BorderBrush="#263043" BorderThickness="1" CornerRadius="10"
+          Padding="20" Margin="24" MaxWidth="600" HorizontalAlignment="Center">
+    <ScrollViewer>
+      <StackPanel Spacing="18">
+
+        <TextBlock Text="SETTINGS" FontSize="11" Foreground="#5a6478" FontWeight="Bold"/>
+
+        <!-- channel -->
+        <StackPanel Spacing="6">
+          <TextBlock Text="Update channel" Foreground="#e8ecf4" FontSize="14" FontWeight="SemiBold"/>
+          <RadioButton GroupName="channel" IsChecked="{Binding StableChannel}"
+                       Content="Stable — finished releases only" Foreground="#aeb7c6"/>
+          <RadioButton GroupName="channel" IsChecked="{Binding BetaChannel}"
+                       Content="Beta — includes pre-releases" Foreground="#aeb7c6"/>
+          <TextBlock Text="Beta installs pre-release builds as soon as they are published. They are newer, less tested, and can be broken; stable never installs one. You can switch back at any time."
+                     TextWrapping="Wrap" Foreground="#8892a6" FontSize="12" Margin="24,2,0,0"/>
+        </StackPanel>
+
+        <!-- install location -->
+        <StackPanel Spacing="6">
+          <TextBlock Text="Install location" Foreground="#e8ecf4" FontSize="14" FontWeight="SemiBold"/>
+          <Grid ColumnDefinitions="*,8,Auto,8,Auto">
+            <TextBox Grid.Column="0" Text="{Binding InstallRootText}" FontSize="12"
+                     Watermark="{Binding DefaultRootText}"/>
+            <Button Grid.Column="2" Content="Browse…" Command="{Binding BrowseCommand}" Padding="14,6"/>
+            <Button Grid.Column="4" Content="Default" Command="{Binding UseDefaultLocationCommand}"
+                    Padding="14,6"/>
+          </Grid>
+          <TextBlock Text="{Binding InstallRootHint}" TextWrapping="Wrap"
+                     Foreground="#8892a6" FontSize="12"/>
+        </StackPanel>
+
+        <!-- relocation confirmation -->
+        <Border IsVisible="{Binding ConfirmVisible}" Background="#1d2433" BorderBrush="#3d4c66"
+                BorderThickness="1" CornerRadius="8" Padding="14">
+          <StackPanel Spacing="10">
+            <TextBlock Text="Move the existing install?" Foreground="#ffd43b"
+                       FontSize="13" FontWeight="SemiBold"/>
+            <TextBlock Text="{Binding ConfirmText}" TextWrapping="Wrap"
+                       Foreground="#aeb7c6" FontSize="12"/>
+            <StackPanel Orientation="Horizontal" Spacing="10" HorizontalAlignment="Right">
+              <Button Content="Keep it where it is" Command="{Binding KeepCurrentLocationCommand}"
+                      Padding="14,6"/>
+              <Button Content="Move and save" Command="{Binding ConfirmMoveCommand}" Padding="14,6"
+                      Background="#2a72b5" Foreground="White"/>
+            </StackPanel>
+          </StackPanel>
+        </Border>
+
+        <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" Foreground="#8892a6" FontSize="12"
+                   IsVisible="{Binding StatusText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+
+        <StackPanel Orientation="Horizontal" Spacing="10" HorizontalAlignment="Right">
+          <Button Content="Cancel" Command="{Binding CancelCommand}" Padding="16,8"/>
+          <Button Content="Save" Command="{Binding SaveCommand}" Padding="22,8"
+                  Background="#2a72b5" Foreground="White"/>
+        </StackPanel>
+
+      </StackPanel>
+    </ScrollViewer>
+  </Border>
+</UserControl>

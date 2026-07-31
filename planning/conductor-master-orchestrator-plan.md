@@ -239,6 +239,24 @@ C3 depends on Launcher A3 (the `Launcher.Protocol` freeze) and on C1, since adop
 
 ## 9. Decisions and open questions
 
+**Multi-region: CDN caching, not master replication.** Settled 2026-07-30.
+
+A player in Sydney querying a master in Europe is a real cost, and the obvious fix is a master per
+region. That fix is much larger than it looks: replication has to answer what happens when two regions
+disagree about whether a server is verified, which region owns a listing's TTL, and what an operator
+sees when a server appears in one region and not another. Those are distributed-systems questions, and
+answering them badly produces a directory that is wrong in ways nobody can reproduce.
+
+The cacheable path is `GET /api/v1/servers`, and it is nearly identical for everyone. It carries a
+strong ETag, a 30 second max-age, and no per-caller state, all of which were deliberate. A CDN in
+front of one origin gives most of the latency win for a configuration change rather than a
+distributed system, and it does it without introducing a single disagreement about what is listed.
+
+What it does not fix: the announce path stays one origin, so a server in Sydney still announces across
+the world every 180 seconds. That is one request per server per three minutes, from a machine sitting
+in a datacentre, which is the cheapest half of the problem and the one nobody notices. Revisit
+replication if announce latency ever becomes the complaint; it will not be first.
+
 Settled 2026-07-30:
 
 - **Hostnames.** `master.vortexfps.org` serves the announce protocol and is the `sv_master_url` default;

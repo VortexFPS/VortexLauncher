@@ -180,8 +180,13 @@ public sealed partial class SourceProvider(LauncherPaths paths, BuildStore build
 
         log?.Report($"extracting {asset.Name}");
         Directory.CreateDirectory(destination);
-        await Task.Run(() => System.IO.Compression.ZipFile.ExtractToDirectory(
-            archive, destination, overwriteFiles: true), ct);
+
+        // Through the same seam the game install uses, and for the same reason: on macOS the Godot
+        // editor is an .app bundle whose Frameworks directory is symlinks, and the managed extractor
+        // drops them silently. That produced an editor that looked installed and would not launch.
+        // Easy to miss here because this path is developer-only, so the failure lands on whoever
+        // first tries a source build on a Mac rather than on a player.
+        await ArchiveExtractor.ForCurrentPlatform().ExtractAsync(archive, destination, ct);
 
         File.Delete(archive);
 

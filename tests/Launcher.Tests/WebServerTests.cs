@@ -11,7 +11,7 @@ namespace Launcher.Tests;
 public class RunnerRegistryTests
 {
     private static RunnerRegistry New() =>
-        new(new WebServerOptions { Token = "t" }, NullLogger<RunnerRegistry>.Instance);
+        new(new WebServerOptions(), NullLogger<RunnerRegistry>.Instance);
 
     [Fact]
     public void No_runner_linked_means_no_default()

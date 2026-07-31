@@ -159,6 +159,10 @@ CI: the per-push gate builds the launcher and runs its tests (plain .NET job, no
   the default install path — an updater that trusts an unsigned manifest lets whoever controls the
   host feed it arbitrary binaries; checksums alone verify transport, not authorship. Deferred only
   because the prototype's blast radius is dev-machines. Tracked as the launcher's v1.2 gate.
+  **Verifying half landed** (`src/Launcher.Core/Signing/`): the launcher checks a minisign signature
+  over `latest.json` when a release carries one, and refuses the release when that check fails. The
+  signing half is the game repo's release job and is still cut; `release-signing.md` states what it
+  has to produce, and why the policy defaults to verify-if-present rather than required until it does.
 - **Code signing (Windows/macOS):** inherits the ADR-0014 cut. Consequence: SmartScreen friction
   on every Windows download and Gatekeeper refusal on macOS (the launcher can clear its *game*
   install's quarantine xattr, but nothing clears the launcher's own). Revisit at wider release.

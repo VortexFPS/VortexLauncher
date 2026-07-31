@@ -86,7 +86,7 @@ public sealed class EventLogParser
         Gametype = null;
     }
 
-    /// <summary>":type:field:field:..." with no state kept.
+    /// <summary>":type:field:field:..." — or bare ":type" — with no state kept.
     ///
     /// Splitting on ':' is what the format allows and it is lossy: chat text containing a colon splits
     /// into extra fields. Callers that want the message body should rejoin from their field index
@@ -98,11 +98,15 @@ public sealed class EventLogParser
             return null;
 
         var end = trimmed.IndexOf(':', 1);
-        if (end <= 1)
+        // "::something" has no type. A line that never reaches a second colon, on the other hand, is
+        // ":gameover" — the one event GameLog.cs writes with nothing after the type, and the one that
+        // ends a match. Requiring the second colon dropped it silently, so MatchLive stayed true
+        // forever against a real server while any fixture that wrote ":gameover:" looked correct.
+        if (end == 1)
             return null;
 
-        var type = trimmed[1..end];
-        var rest = trimmed[(end + 1)..];
+        var type = end < 0 ? trimmed[1..] : trimmed[1..end];
+        var rest = end < 0 ? "" : trimmed[(end + 1)..];
         var fields = rest.Length == 0 ? [] : rest.Split(':');
 
         return new GameEvent { Type = type, Fields = fields, Raw = trimmed };

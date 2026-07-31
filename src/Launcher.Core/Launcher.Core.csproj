@@ -17,4 +17,14 @@
   <ItemGroup>
     <ProjectReference Include="..\Launcher.Protocol\Launcher.Protocol.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- So a test can assert on the pieces that are internal because nothing outside this assembly
+         should call them. The exposition-format escaping rules above all: they are three string
+         replacements whose failure mode is losing an entire scrape, which is worth pinning directly
+         rather than inferring from a rendered payload.
+
+         An MSBuild item and not a PackageReference, so the BCL-only rule ArchitectureTests enforces
+         is untouched. -->
+    <InternalsVisibleTo Include="Launcher.Tests" />
+  </ItemGroup>
 </Project>

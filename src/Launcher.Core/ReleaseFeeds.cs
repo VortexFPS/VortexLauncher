@@ -1,6 +1,8 @@
 using System.Net;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Launcher.Core.Signing;
 
 namespace Launcher.Core;
 
@@ -12,9 +14,16 @@ public interface IReleaseFeed
 
 /// <summary>The default path (ADR-0015 §5): latest.json off the newest FULL release via the
 /// /releases/latest/download redirect. Plain HTTP, no API quota. Returns null (not an error)
-/// while no stable release carries a manifest — the API fallback covers that window.</summary>
-public sealed class ManifestFeed(HttpClient http) : IReleaseFeed
+/// while no stable release carries a manifest — the API fallback covers that window.
+///
+/// This is also where the release signature is checked, and it is checked here rather than in the
+/// installer on purpose: this is the one door a manifest comes through, so verification cannot be
+/// skipped by a caller that forgot to ask for it. See <see cref="ReleaseSigning"/> for why the
+/// manifest is the thing signed.</summary>
+public sealed class ManifestFeed(HttpClient http, ManifestSignaturePolicy? policy = null) : IReleaseFeed
 {
+    private readonly ManifestSignaturePolicy _policy = policy ?? ReleaseSigning.ResolvePolicy();
+
     public string Name => "latest.json (stable channel)";
 
     public async Task<ReleaseManifest?> FetchLatestAsync(CancellationToken ct)
@@ -23,19 +32,69 @@ public sealed class ManifestFeed(HttpClient http) : IReleaseFeed
         if (resp.StatusCode == HttpStatusCode.NotFound)
             return null; // no stable release yet, or it predates latest.json
         resp.EnsureSuccessStatusCode();
-        return ReleaseManifest.Parse(await resp.Content.ReadAsStringAsync(ct));
+
+        // Bytes, not ReadAsStringAsync: the signature covers latest.json exactly as published, and a
+        // trip through string and back would be verifying a re-encoding of it rather than it.
+        var published = await resp.Content.ReadAsByteArrayAsync(ct);
+        var signature = await FetchSignatureAsync(ct);
+        var status = ReleaseSigning.Check(_policy, published, signature, "latest.json");
+
+        // A BOM is part of the signed bytes but chokes the JSON reader, so it comes off after the check.
+        var manifest = ReleaseManifest.Parse(Utf8NoBom(published));
+        return manifest is null ? null : manifest with { SignatureStatus = status };
     }
+
+    /// <summary>The .minisig published beside the manifest, or null if the release carries none.
+    ///
+    /// Only a 404 means "not signed". Any other status throws rather than reading as unsigned,
+    /// because a signature fetch that merely fails looks exactly like one an attacker made fail, and
+    /// letting a 500 mean "no signature here" hands over the downgrade for the price of breaking one
+    /// asset. Note where that guarantee actually lands: this throws
+    /// <see cref="HttpRequestException"/>, which <see cref="CompositeFeed"/> treats as "feed
+    /// unavailable" and moves past. Under <see cref="ManifestSignaturePolicy.Required"/> that is
+    /// still closed, because the only feed behind this one is unsignable and gets refused too.
+    /// Under verify-if-present the chain does land on that unsigned fallback — the same place a 404
+    /// would have left it, which is the policy's known cost, not a hole this method can close.</summary>
+    private async Task<string?> FetchSignatureAsync(CancellationToken ct)
+    {
+        if (_policy == ManifestSignaturePolicy.Off)
+            return null;
+
+        using var resp = await http.GetAsync(LauncherConfig.LatestManifestSignatureUrl, ct);
+        if (resp.StatusCode == HttpStatusCode.NotFound)
+            return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
+    /// <summary>UTF-8 decode minus a byte-order mark, spelled out in bytes because the BOM is part
+    /// of what the signature covers and must not be trimmed before the check.</summary>
+    private static string Utf8NoBom(byte[] bytes) =>
+        Encoding.UTF8.GetString(
+            bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF
+                ? bytes.AsSpan(3)
+                : bytes);
 }
 
 /// <summary>The fallback (and the only path that sees prereleases): list releases via the GitHub
 /// API and synthesize a manifest from the newest non-draft release's assets, taking checksums
-/// from its SHA256SUMS file, else from GitHub's own per-asset sha256 digest.</summary>
-public sealed partial class GitHubApiFeed(HttpClient http) : IReleaseFeed
+/// from its SHA256SUMS file, else from GitHub's own per-asset sha256 digest.
+///
+/// This manifest is assembled here, on the client, out of an API listing — there is no published
+/// document for anyone to have signed, so this feed can never be signature-checked. That is fine
+/// while the policy is verify-if-present and fatal once it is required; see
+/// <see cref="ReleaseSigning.EnsureUnsignedFeedAllowed"/>.</summary>
+public sealed partial class GitHubApiFeed(HttpClient http, ManifestSignaturePolicy? policy = null)
+    : IReleaseFeed
 {
+    private readonly ManifestSignaturePolicy _policy = policy ?? ReleaseSigning.ResolvePolicy();
+
     public string Name => "GitHub Releases API (fallback)";
 
     public async Task<ReleaseManifest?> FetchLatestAsync(CancellationToken ct)
     {
+        ReleaseSigning.EnsureUnsignedFeedAllowed(_policy, Name);
+
         var json = await http.GetStringAsync(LauncherConfig.ReleasesApiUrl, ct);
         var release = PickLatest(json);
         if (release is null)
@@ -100,6 +159,7 @@ public sealed partial class GitHubApiFeed(HttpClient http) : IReleaseFeed
             Platforms = platforms,
             NotesBody = release.Body,
             Prerelease = release.Prerelease,
+            SignatureStatus = "unsigned (assembled from the GitHub API, nothing to verify)",
         };
     }
 
@@ -126,6 +186,16 @@ public sealed partial class GitHubApiFeed(HttpClient http) : IReleaseFeed
 /// the caller NEVER blocks Play on this (ADR-0015 invariant #1).</summary>
 public sealed class CompositeFeed(params IReleaseFeed[] feeds)
 {
+    /// <summary>Note what is NOT caught below: <see cref="ManifestSignatureException"/> propagates out
+    /// of the whole chain. Falling through to the next feed after a signature failure would turn
+    /// "this manifest was tampered with" into "try a source with weaker checks", which is the
+    /// attack, not the recovery. It has to reach the caller as an error with its message intact —
+    /// a soft "feed unavailable" return would be summarized away by the UI, and the one thing a
+    /// failed signature check must not be is quiet. Play is unaffected either way: nothing here
+    /// touches the installed build.
+    ///
+    /// Its <see cref="UnsignableFeedException"/> subclass IS caught, because "this feed has no
+    /// signature to check" is a reason to try the next feed, not to stop.</summary>
     public async Task<(ReleaseManifest? Manifest, string Detail)> FetchLatestAsync(CancellationToken ct)
     {
         var notes = new List<string>();
@@ -137,6 +207,10 @@ public sealed class CompositeFeed(params IReleaseFeed[] feeds)
                 if (m is not null)
                     return (m, $"via {feed.Name}");
                 notes.Add($"{feed.Name}: no release found");
+            }
+            catch (UnsignableFeedException ex)
+            {
+                notes.Add($"{feed.Name}: {ex.Message}");
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {

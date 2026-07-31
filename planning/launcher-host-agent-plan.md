@@ -8,6 +8,13 @@
 **Supersedes:** the ADR-0015 launcher-updater track. That work is the seed of `Launcher.Core` and
 `Launcher.Desktop`, not a separate line of development.
 
+> **This is the design, not the status.** Most of it is built. The milestone table in §9 is kept as a
+> record of the order things were meant to arrive in, and it is no longer a to-do list; read
+> `implementation-roadmap.md` for what actually exists and what is left. Where this document and the
+> code disagree, the code is right and this is stale, with one exception worth knowing: §2's
+> dependency graph is enforced by `tests/Launcher.Tests/ArchitectureTests.cs`, so there the document
+> cannot drift without failing the build.
+
 ## What changed from the 2026-07-12 version
 
 1. `Launcher.Agent` is gone. Its two jobs are now separate deployables: the **runner** (a daemon verb inside

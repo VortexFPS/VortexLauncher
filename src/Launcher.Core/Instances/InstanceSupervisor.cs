@@ -19,6 +19,18 @@ public sealed class InstanceOrchestratedException(InstanceSpec spec)
     };
 }
 
+/// <summary>Raised when a create names an instance this box already has.
+///
+/// Its own type rather than a plain <see cref="InvalidOperationException"/> because a control plane
+/// has to tell "that name is taken" apart from "that spec is malformed" — the first is a field to
+/// correct with everything else the operator typed still on screen, the second is a bug. Matching on
+/// the message text would work until somebody rewords it, which is not a promise a message makes.</summary>
+public sealed class InstanceExistsException(string name)
+    : InvalidOperationException($"instance '{name}' already exists")
+{
+    public string InstanceName { get; } = name;
+}
+
 /// <summary>Who is asking. The runner is the only arbiter of control mode, and it decides by origin
 /// rather than by anything the request asserts about itself.</summary>
 public enum ControlOrigin
@@ -86,7 +98,7 @@ public sealed class InstanceSupervisor : IDisposable
     {
         InstanceStore.ValidateName(spec.Name);
         if (_store.Exists(spec.Name))
-            throw new InvalidOperationException($"instance '{spec.Name}' already exists");
+            throw new InstanceExistsException(spec.Name);
 
         _store.Save(spec);
         _store.EnsureDefaultConfig(spec);
@@ -115,6 +127,19 @@ public sealed class InstanceSupervisor : IDisposable
 
         _store.Save(merged);
         instance.UpdateSpec(merged);
+    }
+
+    /// <summary>Replace an instance's server.cfg.
+    ///
+    /// Gated like every other mutation, and it belongs in the gated set rather than beside the log
+    /// reads: this file decides what the server comes up as, so writing it while an orchestrator holds
+    /// the instance is the two-writers problem the control mode exists to prevent. The owner still
+    /// reads it, and their two exits are how they get the write back.</summary>
+    public void WriteConfig(string name, string text, ControlOrigin origin)
+    {
+        var instance = Require(name);
+        Authorize(instance.Spec, origin);
+        _store.SaveConfig(name, text);
     }
 
     public async Task StartAsync(string name, ControlOrigin origin, CancellationToken ct = default)

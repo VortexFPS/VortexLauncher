@@ -7,14 +7,35 @@ namespace Launcher.WebServer;
 
 public sealed class WebServerOptions
 {
-    /// <summary>Bearer token for every request, including the WebSocket upgrade. Generated at
-    /// `vortex runner install-service` and stored hashed.</summary>
-    public string? Token { get; set; }
+    /// <summary>Where the runner keeps runner.json, which holds the hash of the bearer token every
+    /// request must carry. Null means the well-known per-user location, which is right whenever the
+    /// runner was not pointed elsewhere with `--data-root`.
+    ///
+    /// There is deliberately no plaintext token setting. One existed, nothing ever wrote it, and a
+    /// panel that rejects everything until somebody hand-edits a config file is not a credential
+    /// model. See <see cref="RunnerTokenStore"/> for why the hash lives in the runner's file rather
+    /// than a copy of its own here.</summary>
+    public string? RunnerConfigPath { get; set; }
 
     /// <summary>Binding beyond loopback requires this to be set deliberately, and either TLS or a
     /// documented reverse proxy in front. The default is the safe one because the unsafe one is a
-    /// panel with a bearer token on a public interface.</summary>
+    /// panel with a bearer token on a public interface. On its own this setting is not enough:
+    /// <see cref="BindingGate"/> refuses to start unless <see cref="CertificatePath"/> or
+    /// <see cref="BehindReverseProxy"/> comes with it.</summary>
     public bool AllowRemoteBinding { get; set; }
+
+    /// <summary>PKCS#12 (.pfx) file this process serves HTTPS from. One of the two ways to satisfy
+    /// <see cref="AllowRemoteBinding"/>, and the one that does not depend on anything outside this
+    /// process being configured correctly.</summary>
+    public string? CertificatePath { get; set; }
+
+    /// <summary>Password for <see cref="CertificatePath"/>, where the file has one.</summary>
+    public string? CertificatePassword { get; set; }
+
+    /// <summary>States that a reverse proxy in front of this process terminates TLS. It is an
+    /// acknowledgement rather than a feature: nothing here can check that a proxy exists, so what the
+    /// setting buys is that somebody had to assert it on purpose before the API left loopback.</summary>
+    public bool BehindReverseProxy { get; set; }
 
     public int CommandTimeoutSeconds { get; set; } = 30;
 }
@@ -40,6 +61,10 @@ public sealed class RunnerRegistry(WebServerOptions options, ILogger<RunnerRegis
     private readonly ConcurrentDictionary<string, LinkedRunner> _runners = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, TaskCompletionSource<CommandResult>> _pending = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, List<Action<LogLine>>> _logSubscribers = new(StringComparer.Ordinal);
+
+    /// <summary>Instance name -> how many viewers are watching it. A runner forwards log lines only
+    /// for instances a plane asked for, so this is what decides when to ask and when to stop.</summary>
+    private readonly Dictionary<string, int> _watchers = new(StringComparer.Ordinal);
 
     public IReadOnlyCollection<LinkedRunner> All => _runners.Values.ToList();
 
@@ -86,6 +111,66 @@ public sealed class RunnerRegistry(WebServerOptions options, ILogger<RunnerRegis
         {
             lock (list)
                 list.Remove(handler);
+        });
+    }
+
+    /// <summary>Watch one instance's log stream, and keep the runner forwarding it for as long as
+    /// anybody is.
+    ///
+    /// Reference counted rather than one subscribe per viewer and one unsubscribe per close. Two
+    /// operators on the same server is an ordinary thing — the on-call one and whoever is being asked
+    /// about it — and an unsubscribe sent when either of them closes a tab stops the lines arriving for
+    /// the other, with nothing on their screen to say so. It reads as a dead console, and the fix looks
+    /// like reloading the page, which is how it stays unreported.
+    ///
+    /// The count and the frame are decided under the same lock so two viewers arriving at once cannot
+    /// both skip the subscribe, and the frame itself is sent outside it: a socket write must not be
+    /// able to hold the count of every instance on the box.</summary>
+    public async Task<IAsyncDisposable> WatchLogsAsync(LinkedRunner runner, string instance,
+        Action<LogLine> handler, CancellationToken ct)
+    {
+        var subscription = SubscribeLogs(instance, handler);
+
+        bool first;
+        lock (_watchers)
+        {
+            _watchers.TryGetValue(instance, out var count);
+            _watchers[instance] = count + 1;
+            first = count == 0;
+        }
+
+        if (first)
+            await SendFrameAsync(runner, new PlaneFrame
+            {
+                Kind = PlaneFrameKind.Subscribe,
+                InstanceName = instance,
+            }, ct);
+
+        return new AsyncSubscription(async () =>
+        {
+            subscription.Dispose();
+
+            bool last;
+            lock (_watchers)
+            {
+                var count = _watchers.TryGetValue(instance, out var current) ? current - 1 : 0;
+                last = count <= 0;
+                if (last)
+                    _watchers.Remove(instance);
+                else
+                    _watchers[instance] = count;
+            }
+
+            if (!last)
+                return;
+
+            // Not the caller's token: this runs while a socket is being torn down, and the usual
+            // reason for that is the token that was cancelled.
+            await SendFrameAsync(runner, new PlaneFrame
+            {
+                Kind = PlaneFrameKind.Unsubscribe,
+                InstanceName = instance,
+            }, CancellationToken.None);
         });
     }
 
@@ -153,5 +238,10 @@ public sealed class RunnerRegistry(WebServerOptions options, ILogger<RunnerRegis
     private sealed class Subscription(Action dispose) : IDisposable
     {
         public void Dispose() => dispose();
+    }
+
+    private sealed class AsyncSubscription(Func<ValueTask> dispose) : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync() => dispose();
     }
 }

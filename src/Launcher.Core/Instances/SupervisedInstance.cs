@@ -14,7 +14,11 @@ namespace Launcher.Core.Instances;
 /// could have gone down a pipe adds an authentication surface for nothing.</summary>
 public sealed class SupervisedInstance : IDisposable
 {
-    private const int LogRingLines = 2000;
+    /// <summary>How much recent output this instance keeps in memory. Public because it is also the
+    /// ceiling the log route clamps `?tail=` to: asking for more than the ring holds is not an error,
+    /// but there is no honest answer above this number and the request should not size an allocation
+    /// off a URL.</summary>
+    public const int LogRingLines = 2000;
 
     private readonly InstanceStore _store;
     private readonly BuildStore _builds;
@@ -138,6 +142,7 @@ public sealed class SupervisedInstance : IDisposable
             psi.ArgumentList.Add("+map");
             psi.ArgumentList.Add(Spec.Map);
         }
+        AddAnnounceArgs(psi);
         foreach (var arg in Spec.ExtraArgs ?? [])
             psi.ArgumentList.Add(arg);
         foreach (var (key, value) in Spec.Environment ?? new Dictionary<string, string>())
@@ -165,6 +170,53 @@ public sealed class SupervisedInstance : IDisposable
 
         Emit(LogStream.Runner, $"started pid {_process.Id} on port {Spec.Port} from build {build.Id}");
         State = InstanceState.Running;
+    }
+
+    /// <summary>Pin the master-announce cvars on the launch line, so a runner-started server is
+    /// actually visible in the server browser. Without them sv_public stays unregistered at 0 and the
+    /// server deliberately announces nothing, which makes every instance on the box invisible.
+    ///
+    /// The command line rather than server.cfg, because these are runner state and runner state
+    /// changes underneath a server that is already installed. `vortex runner rotate-key` replaces the
+    /// control key; link and unlink flip the offer. server.cfg is written once by EnsureDefaultConfig
+    /// and never rewritten - it belongs to the operator - so a fingerprint baked into it would keep
+    /// announcing a key this box no longer holds, offering control that can never be proved. Read from
+    /// the runner config at every start instead, which is what makes rotate-key's promise true:
+    /// running servers announce the old fingerprint only until they restart. It also means the runner
+    /// never edits a file the operator owns.
+    ///
+    /// The game applies --cvar pins after server.cfg (DS-5), so these beat a stale copy somebody left
+    /// in there, and an instance's own ExtraArgs are appended after these and still win.</summary>
+    private void AddAnnounceArgs(ProcessStartInfo psi)
+    {
+        // From disk on every start, not captured at construction: `vortex runner rotate-key` runs in
+        // its own process, and a supervisor holding a snapshot would launch with the superseded key.
+        var runner = new RunnerConfigStore(_store.LauncherPaths).Load();
+
+        // Explicit in both directions. The 1 is what makes a listed instance announce at all; the 0
+        // is what makes Spec.Listed authoritative over a `set sv_public 1` in an operator's server.cfg,
+        // so turning listing off for one instance actually turns it off.
+        Pin(psi, "sv_public", Spec.Listed ? "1" : "0");
+
+        // Only when this box was pointed somewhere else. Unset means the game's own default, which is
+        // the address the announce protocol names.
+        if (runner.MasterUrl is { Length: > 0 } master)
+            Pin(psi, "sv_master_url", master);
+
+        // The adoption offer and the key it binds to, together or not at all. An offer with no
+        // fingerprint fails validation at the master and costs the whole listing, turning a runner
+        // that is merely unlinked into a server nobody can find. Cleared rather than omitted when this
+        // box is not offering, so an earlier link's fingerprint cannot survive in server.cfg.
+        var offering = runner.ConductorControl && runner.ControlKeyFingerprint is { Length: > 0 };
+        Pin(psi, "conductor_control", offering ? "1" : "0");
+        Pin(psi, "conductor_control_key", offering ? runner.ControlKeyFingerprint! : "");
+    }
+
+    private static void Pin(ProcessStartInfo psi, string cvar, string value)
+    {
+        psi.ArgumentList.Add("--cvar");
+        psi.ArgumentList.Add(cvar);
+        psi.ArgumentList.Add(value);
     }
 
     /// <summary>Ask the server to quit over stdin, then wait, then kill.

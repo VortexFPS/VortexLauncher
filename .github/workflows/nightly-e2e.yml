@@ -1,0 +1,356 @@
+name: nightly-e2e
+
+# The path a new operator walks on day one: put a build on the box, create an instance, boot it, query
+# it, drive it, stop it. Every piece of that has unit tests and the seams between them have none, which
+# is where a fresh box actually fails.
+#
+# Nightly rather than on every push because it starts real processes and waits on real UDP sockets:
+# slower than the unit suite and flakier by nature. A failure here is not a merge blocker, it is
+# "something in the operator path broke and no test noticed".
+#
+# It runs the game server fixture, not the game. Godot is not installed on a runner and the thing under
+# test is the runner's lifecycle, not the game's rendering: what has to be exercised is the supervisor's
+# contract with whatever it spawned - four arguments, a bound UDP port that answers getinfo, stdin, and
+# an exit. tests/Launcher.FakeGameServer implements exactly that contract.
+
+on:
+  schedule:
+    # 03:17 UTC. Off the hour on purpose: GitHub queues scheduled workflows and everybody else's cron
+    # is 0 3 * * *, so the top of the hour is where the delay lives.
+    - cron: "17 3 * * *"
+  # A change to the CLI verbs, the supervisor or the fixture is worth running this against by hand
+  # rather than finding out the next morning.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  boot-a-server:
+    runs-on: ubuntu-latest
+    # Every wait below is bounded, so this ceiling only catches a bug in the workflow itself. A hung
+    # fixture holds its port and waits forever, and a job that does the same burns an hour of runner
+    # time to tell us nothing.
+    timeout-minutes: 20
+    defaults:
+      run:
+        # Named explicitly to get `-eo pipefail`. The implicit Linux shell is `bash -e` with no
+        # pipefail, and every assertion here is a command piped into jq: without it, `vortex` exiting
+        # non-zero would be hidden by jq exiting 0 on the empty input.
+        shell: bash
+    env:
+      # Not a version anybody could mistake for a release, and the same string the fixture reports as
+      # its gameversion.
+      BUILD_ID: 0.0.0-fake
+      INSTANCE: nightly
+      # PORT is deliberately not here: it comes out of `server create` at run time. See that step.
+      #
+      # Neither of these is the fixture's built-in default (stormkeep). A server that ignored `+map`
+      # and every console command would still report the default, so asserting on it would prove
+      # nothing about either path.
+      BOOT_MAP: coldforge
+      EXEC_MAP: ironworks
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # Everything this job writes lives in one scratch directory outside the checkout: the published
+      # CLI, the fixture's "install", and the data root the runner keeps instances in. The real root is
+      # LocalApplicationData/VortexArena/Launcher (RunnerLayout.DefaultDataRoot), which nothing here may
+      # touch - the create step asserts that it never appeared.
+      - name: Choose a scratch data root
+        run: |
+          echo "SCRATCH=$RUNNER_TEMP/vortex-e2e" >> "$GITHUB_ENV"
+          echo "DATA_ROOT=$RUNNER_TEMP/vortex-e2e/data" >> "$GITHUB_ENV"
+          echo "OUT=$RUNNER_TEMP/vortex-e2e/out" >> "$GITHUB_ENV"
+          echo "VORTEX=$RUNNER_TEMP/vortex-e2e/cli/vortex" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/vortex-e2e/out"
+
+      # Release, because that is the configuration an operator installs. A Debug-only pass is the kind
+      # of difference nobody thinks to check when CI is green and the box is not.
+      - name: Publish the vortex CLI
+        run: dotnet publish src/Launcher.Cli -c Release -o "$(dirname "$VORTEX")" --nologo
+
+      # Register the fixture as an installed build.
+      #
+      # There is no CLI verb for this, and this workflow does not add one. `vortex install` downloads a
+      # real release from GitHub Releases; `vortex builds list|pin|gc` only operate on builds that are
+      # already on disk; BuildStore.Register is a library call with nothing exposing it. So the honest
+      # route is the one BuildStore already documents: its list is derived from what is actually in
+      # versions/ and only enriched from builds.json, precisely so that an install carrying no metadata
+      # is adopted instead of orphaned. Laying the fixture out the way an extracted release lands drives
+      # that production path rather than opening a test-only hole into it.
+      #
+      # The layout BuildStore.List() reads (src/Launcher.Core/BuildStore.cs):
+      #   versions/<id>/                            the directory name becomes the build id and version
+      #   versions/<id>/<root>/                     the zip's single top-level dir; Root is recovered
+      #                                             from it being the only one, hence the count below
+      #   versions/<id>/<root>/VortexArena.x86_64   PlatformKey.ExecutableCandidates(linux-x86_64)
+      #
+      # The binary carries the client name because an adopted build is stamped with PlatformKey.Current,
+      # which on this runner is linux-x86_64; the dedicated key's binary name
+      # (vortexarena-dedicated.x86_64) would never be probed for. The runner passes --dedicated either
+      # way, and the fixture accepts it.
+      - name: Publish the fake game server as an installed build
+        run: |
+          game_dir="$DATA_ROOT/game/versions/$BUILD_ID/linux-client"
+          dotnet publish tests/Launcher.FakeGameServer -c Release -o "$game_dir" --nologo
+
+          # A copy rather than a rename: the apphost locates its managed dll by the name baked into it,
+          # resolved against its own directory, so a second name for the same bytes just works. Leaving
+          # Launcher.FakeGameServer in place also keeps the directory honest about what it holds.
+          cp "$game_dir/Launcher.FakeGameServer" "$game_dir/VortexArena.x86_64"
+          chmod +x "$game_dir/VortexArena.x86_64"
+
+          # Root is "the one directory in here". If publish ever emitted a second one - satellite
+          # resource assemblies, a runtimes/ tree - Root would come back empty and the only symptom
+          # would arrive two steps later as "no game binary in ...".
+          dirs=$(find "$DATA_ROOT/game/versions/$BUILD_ID" -mindepth 1 -maxdepth 1 -type d | wc -l)
+          if [ "$dirs" -ne 1 ]; then
+            echo "::error::expected exactly one directory under versions/$BUILD_ID, found $dirs"
+            find "$DATA_ROOT/game/versions/$BUILD_ID" -maxdepth 1
+            exit 1
+          fi
+
+      # Proof that what the previous step wrote is a build the store can see, and that a build it can
+      # see is one it can pin - a build that lists but will not pin is a rollback that fails on the day
+      # it is needed.
+      #
+      # `pin` is a weaker check than it reads as, and is not the step that proves the layout is right:
+      # InstallService.Pin only asserts the build's directory still exists, never that a game binary is
+      # in it. Starting the server is what proves the layout, which is why that assertion is not
+      # duplicated here.
+      - name: The build store adopts it
+        run: |
+          "$VORTEX" builds list --json --data-root "$DATA_ROOT" | tee "$OUT/builds.json"
+          jq -e --arg id "$BUILD_ID" '.ok and any(.data[]; .id == $id)' "$OUT/builds.json" > /dev/null
+          "$VORTEX" builds pin "$BUILD_ID" --json --data-root "$DATA_ROOT" | jq -e '.ok' > /dev/null
+
+      - name: Create an instance in the scratch data root
+        run: |
+          # No --port, so PortPool.Allocate picks one, and the second reason for that is the one that
+          # matters. A fixed 26000 is the game's own default port: on a self-hosted runner this job
+          # would fight a real server somebody runs for players, and the collision would surface as the
+          # fixture failing to bind - a product-shaped failure with a CI-shaped cause. It also puts the
+          # pool on the tested path, including its bind probe, which is what an operator creating their
+          # second instance actually uses; passing --port is the rarer case.
+          "$VORTEX" server create "$INSTANCE" \
+            --map "$BOOT_MAP" --build "$BUILD_ID" \
+            --json --data-root "$DATA_ROOT" | tee "$OUT/create.json"
+          # The range is the assertion. Any number would prove a port was written down; one inside the
+          # pool's own 26000-26099 proves it came from the allocator rather than from a default
+          # somebody left in a spec.
+          jq -e '.ok and (.data.port | type) == "number"
+                 and .data.port >= 26000 and .data.port <= 26099' "$OUT/create.json" > /dev/null
+
+          # Every socket check below is against this. It has to be what the runner assigned, not what
+          # this file guessed, or those checks are watching a port nothing was ever on.
+          echo "PORT=$(jq -r '.data.port' "$OUT/create.json")" >> "$GITHUB_ENV"
+
+          # --data-root has to divert everything, not most things. A path that quietly fell back to the
+          # per-user default would be writing into an operator's real instances on their box, and the
+          # only place that is cheap to notice is a machine where the default root does not exist yet.
+          #
+          # Derived the way RunnerLayout.DefaultDataRoot derives it, rather than hardcoded to
+          # ~/.local/share: SpecialFolder.LocalApplicationData honours XDG_DATA_HOME on .NET/Linux, so
+          # a runner image that ever sets it would move the real root and leave this check watching an
+          # empty path that can never fail - a green assertion guarding nothing.
+          default_root="${XDG_DATA_HOME:-$HOME/.local/share}/VortexArena"
+          if [ -e "$default_root" ]; then
+            echo "::error::a --data-root run created $default_root"
+            find "$default_root" -maxdepth 3
+            exit 1
+          fi
+
+      - name: Start it and wait until it answers
+        run: |
+          "$VORTEX" server start "$INSTANCE" --json --data-root "$DATA_ROOT" | tee "$OUT/start.json"
+
+          # Recorded before it is asserted on, and deliberately in that order. `server start` has
+          # already spawned the child by the time it prints anything, so a pid that then fails the
+          # assertion below still names a live process holding the port. Capturing it afterwards would
+          # leave teardown with nothing to kill in precisely the case where there is something to kill.
+          # Kept for the stop assertion too: "stopped" has to mean this process is gone, not merely
+          # that the runner stopped listing it.
+          echo "SERVER_PID=$(jq -r '.data.pid // empty' "$OUT/start.json")" >> "$GITHUB_ENV"
+
+          # The pid is asserted, not just read: it is the only handle CI has on the process the runner
+          # spawned, and every check after the stop is built on it.
+          jq -e '.ok and .data.state == "running" and .data.pid > 0' "$OUT/start.json" > /dev/null
+
+          # `server list` re-attaches to what is on disk, probes anything it finds running, and reports
+          # the map out of the server's own getinfo reply. Both halves are needed: the state comes from
+          # the runner and the map comes from the server, and only the pair means it booted. A process
+          # that started is not a server that bound.
+          #
+          # A timeout here does not by itself mean the server never came up. instances/<name>/instance.pid
+          # is the entire re-attach mechanism, so an instance the runner cannot re-attach to reads
+          # exactly like one that never started; the diagnostics step prints that file for this reason.
+          deadline=$((SECONDS + 60))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            "$VORTEX" server list --json --data-root "$DATA_ROOT" > "$OUT/list.json"
+            if jq -e --arg n "$INSTANCE" --arg m "$BOOT_MAP" \
+                 'any(.data[]; .name == $n and .state == "running" and .map == $m)' \
+                 "$OUT/list.json" > /dev/null; then
+              echo "$INSTANCE is running and answering getinfo on $BOOT_MAP"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "::error::$INSTANCE never reported running on $BOOT_MAP within 60s"
+          cat "$OUT/list.json"
+          exit 1
+
+      # An operator on a headless box types `server start` and then `server exec`, in two shells,
+      # minutes apart. That is the advertised path - ServerCommands' own summary is that running a
+      # server must not require a control plane - so it is the path this asserts, and it is a separate
+      # claim from the one the step above makes. Neither depends on the other failing.
+      - name: Send a console command and watch it land
+        run: |
+          "$VORTEX" server exec "$INSTANCE" "map $EXEC_MAP" \
+            --json --data-root "$DATA_ROOT" | jq -e '.ok' > /dev/null
+
+          # Asserted through getinfo rather than through the console log, for two reasons. The log ring
+          # lives in the process that started the server, so a later `vortex server console` cannot show
+          # a line written after that process exited. And the round trip is the stronger claim anyway:
+          # the command reached the server's stdin, the server acted on it, and the runner can see the
+          # result from outside.
+          deadline=$((SECONDS + 30))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            "$VORTEX" server list --json --data-root "$DATA_ROOT" > "$OUT/list.json"
+            if jq -e --arg n "$INSTANCE" --arg m "$EXEC_MAP" \
+                 'any(.data[]; .name == $n and .map == $m)' "$OUT/list.json" > /dev/null; then
+              echo "the console command landed: $INSTANCE is on $EXEC_MAP"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "::error::sent 'map $EXEC_MAP' over the console but $INSTANCE never reported it"
+          cat "$OUT/list.json"
+          exit 1
+
+      - name: Stop it and prove the process is gone
+        run: |
+          started=$SECONDS
+          "$VORTEX" server stop "$INSTANCE" --json --data-root "$DATA_ROOT" | tee "$OUT/stop.json"
+          elapsed=$((SECONDS - started))
+          jq -e '.ok and .data.state == "stopped"' "$OUT/stop.json" > /dev/null
+
+          # The polite path writes "quit" to stdin and only kills after a 20s grace period, and both
+          # outcomes report success. The clock is the only thing that separates "the server shut itself
+          # down" from "the runner waited out the grace period and killed it", and the difference is a
+          # server that got to write its ban list from one that did not.
+          if [ "$elapsed" -ge 10 ]; then
+            echo "::error::stop took ${elapsed}s; the server did not quit on its own and was killed"
+            exit 1
+          fi
+
+          # A server still running while the runner calls it stopped is worse than a stop that failed
+          # loudly: it holds the port, so the next start fails somewhere with no connection to the cause.
+          if kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "::error::pid $SERVER_PID is still alive after a successful stop"
+            exit 1
+          fi
+          if [ -n "$(ss -H -lun "sport = :$PORT")" ]; then
+            echo "::error::something is still bound to UDP $PORT after the stop"
+            ss -lunp "sport = :$PORT" || true
+            exit 1
+          fi
+          # A pidfile that outlives its process is how the next runner adopts a ghost: TryAdopt reads
+          # this file first, and a recycled pid is a live process that answers to nothing.
+          if [ -e "$DATA_ROOT/instances/$INSTANCE/instance.pid" ]; then
+            echo "::error::instance.pid outlived the process it names"
+            exit 1
+          fi
+
+      # Everything a human would go looking for at 9am after reading "nightly-e2e failed", collected
+      # while the scratch root still exists. Nothing here can fail the job; the failure already happened.
+      - name: What the runner saw
+        if: failure()
+        run: |
+          set +e
+          echo "::group::vortex builds list"
+          "$VORTEX" builds list --json --data-root "$DATA_ROOT"
+          echo "::endgroup::"
+          echo "::group::vortex server list"
+          "$VORTEX" server list --json --data-root "$DATA_ROOT"
+          echo "::endgroup::"
+          echo "::group::instance on disk"
+          find "$DATA_ROOT/instances" -maxdepth 3
+          echo "instance.pid: $(cat "$DATA_ROOT/instances/$INSTANCE/instance.pid" 2>/dev/null || echo '(absent)')"
+          echo "::endgroup::"
+          echo "::group::server log"
+          # Written by whichever vortex process owned the child, and it stops where that process exited.
+          tail -n 200 "$DATA_ROOT/instances/$INSTANCE/logs/"*.log
+          echo "::endgroup::"
+          echo "::group::processes and sockets"
+          ps -eo pid,ppid,etime,args | grep -i '[V]ortexArena'
+          ss -lunp "sport = :$PORT"
+          echo "::endgroup::"
+
+          # Two defects were known when this workflow was written, and both were left asserted rather
+          # than worked around. Printed here so a red run is read against them instead of being
+          # rediscovered, and so that a NEW failure is recognisable as new. They are independent:
+          # fixing either one on its own does not turn this job green.
+          echo "::group::known causes as of the day this was written"
+          cat <<'KNOWN'
+          1. The pidfile is deleted while the process is still alive.
+             SupervisedInstance.Cleanup() (Instances/SupervisedInstance.cs) deletes instance.pid
+             unconditionally, and Dispose() calls it. ServerCommands disposes its supervisor when the
+             verb returns, so `server start` deletes the pidfile of the child it just spawned. The
+             child survives - reparented, stdin at EOF, still bound and answering - but the next
+             `vortex` invocation has nothing to TryAdopt() from, so `server list` says "stopped" with
+             no map and `server stop` reports ok while leaking a process that still holds the port.
+             It fires for an adopted instance too: on a box running `vortex runner run`, a single
+             `vortex server list` deletes the pidfile out from under the daemon. That contradicts
+             RunnerCommands.InstallService, whose unit file sets KillMode=process specifically so
+             "the next runner adopts them from their pidfiles".
+             Symptom here: the start step times out, and instance.pid prints as (absent) above while
+             the process and the socket are both listed.
+
+          2. There is no command path to an instance this process did not start.
+             TryAdopt() sets _stdin = null with the comment "commands go over rcon", and SendAsync()
+             throws IOException when _stdin is null. Nothing routes to rcon: SendViaRconAsync has no
+             callers anywhere in the repo. So `server exec` on an adopted instance fails no_stdin
+             (exit 6), and the remediation the CLI prints - "set rcon_password in server.cfg" - cannot
+             help, because no code reads that password. Independent of (1): fixing the pidfile makes
+             adoption succeed, and exec still fails.
+             Symptom here: the exec step exits 6 before its poll loop runs.
+          KNOWN
+          echo "::endgroup::"
+          exit 0
+
+      # Runs whatever happened above. A hosted runner is thrown away afterwards, but this job must not
+      # depend on that: on a self-hosted one a leaked fixture keeps UDP 26000 and tomorrow night's run
+      # fails at boot looking exactly like a product bug.
+      - name: Tear down the scratch data root
+        if: always()
+        run: |
+          set +e
+          if [ -n "${SERVER_PID:-}" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "fixture pid $SERVER_PID outlived the test; killing it"
+            kill "$SERVER_PID"
+            sleep 2
+            kill -9 "$SERVER_PID" 2>/dev/null
+          fi
+
+          # Then by path, because SERVER_PID only exists if `server start` got as far as printing one.
+          # A start that spawned the child and then failed leaves a process no variable names, which is
+          # the one case where a leak is both most likely and least visible.
+          #
+          # Matched on the scratch root, not on the binary name: $RUNNER_TEMP is unique to this job, so
+          # this cannot reach a real VortexArena that a self-hosted box is running for players. Guarded
+          # on the variable being set, because `pkill -f ""` matches every process on the machine.
+          if [ -n "${SCRATCH:-}" ]; then
+            pkill -f "$SCRATCH" 2>/dev/null && sleep 2 && pkill -9 -f "$SCRATCH" 2>/dev/null
+            rm -rf "$SCRATCH"
+            if [ -e "$SCRATCH" ]; then
+              echo "::warning::$SCRATCH survived teardown; the next run on this machine inherits it"
+            fi
+          fi
+          exit 0

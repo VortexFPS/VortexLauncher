@@ -1,5 +1,6 @@
 using System.CommandLine;
 using Launcher.Core;
+using Launcher.Core.Signing;
 
 namespace Launcher.Cli;
 
@@ -12,6 +13,28 @@ public static class PlayerCommands
         root.Subcommands.Add(Install(jsonOption, rootOption));
         root.Subcommands.Add(Update(jsonOption, rootOption));
         root.Subcommands.Add(Launch(jsonOption, rootOption));
+    }
+
+    /// <summary>The feed call install and update share, with the one failure that must not reach
+    /// System.CommandLine's default handler peeled off.
+    ///
+    /// A refused signature is a verdict, not a crash. Left to propagate it prints a stack trace,
+    /// which under --json lands on stdout and breaks the promise that stdout is one parseable
+    /// document, and which buries a message written to tell a player what happened. Both callers go
+    /// through here rather than each catching it, because the one that forgets is the one that
+    /// reports a tampered manifest as an unhandled exception.</summary>
+    private static async Task<(ReleaseManifest? Manifest, string Detail, string? SignatureError)>
+        FetchLatestAsync(HttpClient http, CancellationToken ct)
+    {
+        try
+        {
+            var (manifest, detail) = await LauncherHttp.DefaultFeed(http).FetchLatestAsync(ct);
+            return (manifest, detail, null);
+        }
+        catch (ManifestSignatureException ex)
+        {
+            return (null, "", ex.Message);
+        }
     }
 
     private static Command Install(Option<bool> jsonOption, Option<string?> rootOption)
@@ -37,7 +60,9 @@ public static class PlayerCommands
             using var http = LauncherHttp.Create();
             var installs = new InstallService(paths, new DownloadService(http));
 
-            var (manifest, detail) = await LauncherHttp.DefaultFeed(http).FetchLatestAsync(ct);
+            var (manifest, detail, signatureError) = await FetchLatestAsync(http, ct);
+            if (signatureError is not null)
+                return output.Fail("signature_failed", signatureError, ExitCodes.VerificationFailed);
             if (manifest is null)
                 return output.Fail("feed_unavailable",
                     $"no release found ({detail})", ExitCodes.Unavailable);
@@ -82,7 +107,9 @@ public static class PlayerCommands
             var installs = new InstallService(paths, new DownloadService(http));
             var installed = installs.LoadCurrent();
 
-            var (manifest, detail) = await LauncherHttp.DefaultFeed(http).FetchLatestAsync(ct);
+            var (manifest, detail, signatureError) = await FetchLatestAsync(http, ct);
+            if (signatureError is not null)
+                return output.Fail("signature_failed", signatureError, ExitCodes.VerificationFailed);
             if (manifest is null)
                 return output.Fail("feed_unavailable",
                     $"could not reach the release feed ({detail})", ExitCodes.Unavailable);

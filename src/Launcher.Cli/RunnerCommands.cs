@@ -1,6 +1,9 @@
 using System.CommandLine;
+using System.Net;
+using System.Net.Sockets;
 using Launcher.Core;
 using Launcher.Core.Instances;
+using Launcher.Core.Metrics;
 using Launcher.Protocol;
 
 namespace Launcher.Cli;
@@ -20,6 +23,7 @@ public static class RunnerCommands
         runner.Subcommands.Add(Link(jsonOption, rootOption));
         runner.Subcommands.Add(Unlink(jsonOption, rootOption));
         runner.Subcommands.Add(RotateKey(jsonOption, rootOption));
+        runner.Subcommands.Add(NewToken(jsonOption, rootOption));
         runner.Subcommands.Add(InstallService(jsonOption, rootOption));
         root.Subcommands.Add(runner);
     }
@@ -28,12 +32,24 @@ public static class RunnerCommands
     {
         var command = new Command("run", "run the supervisor in the foreground");
 
+        var metricsPort = new Option<int?>("--metrics-port")
+        {
+            Description = "port for the Prometheus scrape endpoint, or 0 to run none",
+        };
+        var metricsBind = new Option<string?>("--metrics-bind")
+        {
+            Description = "address the scrape endpoint binds to (default 127.0.0.1)",
+        };
+        command.Options.Add(metricsPort);
+        command.Options.Add(metricsBind);
+
         command.SetAction(async (parse, ct) =>
         {
             var output = new Output(parse.GetValue(jsonOption));
             var paths = new LauncherPaths(parse.GetValue(rootOption));
             var runnerId = RunnerIdentity.LoadOrCreate(paths);
             var config = new RunnerConfigStore(paths).Load();
+            var startedAt = DateTimeOffset.UtcNow;
 
             var store = new InstanceStore(paths);
             using var supervisor = new InstanceSupervisor(store, new BuildStore(paths));
@@ -48,9 +64,22 @@ public static class RunnerCommands
             output.Progress($"runner {runnerId} up; {supervisor.All().Count} instance(s), " +
                             $"{adopted} already running");
 
+            // On the runner rather than on the WebServer, because the runner is what has the numbers
+            // and the WebServer may not be running at all: a box under pure Conductor control never
+            // starts one, and a box under local control can have it stopped for an upgrade while forty
+            // players are still connected. Metrics that disappear whenever the dashboard does are
+            // metrics nobody can alert on.
+            using var metrics = StartMetrics(output, config, supervisor, runnerId, startedAt, paths,
+                parse.GetValue(metricsPort), parse.GetValue(metricsBind), ct);
+
+            // One expression decides both whether this box dials a Conductor and what its status
+            // reports, so the snapshot cannot name a plane the runner never linked to. Both halves
+            // have to be true: an address with the opt-in switched off is a box that offers nothing.
+            var conductorUrl = config.ConductorControl ? config.ConductorUrl : null;
+
             var contentHttp = LauncherHttp.Create();
             var dispatcher = new CommandDispatcher(supervisor, new BuildStore(paths),
-                new ContentFetcher(paths, contentHttp), config.ContentBaseUrl);
+                new ContentFetcher(paths, contentHttp), config.ContentBaseUrl, conductorUrl);
             var links = new List<RunnerLink>();
 
             // The owner's own control plane. Outbound even though it is usually on this same box.
@@ -65,13 +94,13 @@ public static class RunnerCommands
 
             // The orchestrator, if this box has been adopted. Commands from here arrive with
             // ControlOrigin.Orchestrator, which is what the supervisor arbitrates control mode on.
-            if (config.ConductorControl && config.ConductorUrl is not null)
+            if (conductorUrl is not null)
             {
-                var conductor = new RunnerLink(config.ConductorUrl, runnerId, dispatcher, supervisor,
+                var conductor = new RunnerLink(conductorUrl, runnerId, dispatcher, supervisor,
                     ControlOrigin.Orchestrator);
                 links.Add(conductor);
                 _ = conductor.RunAsync(ct);
-                output.Progress($"offering control to {config.ConductorUrl}");
+                output.Progress($"offering control to {conductorUrl}");
             }
             else if (config.ConductorControl)
             {
@@ -114,6 +143,50 @@ public static class RunnerCommands
         return command;
     }
 
+    /// <summary>Bind the scrape endpoint, or explain why there is none and carry on.
+    ///
+    /// Nothing here is allowed to be fatal. A port already taken, an address that does not parse, a
+    /// container with no permission to bind: every one of those is a reason to have no metrics, and
+    /// none of them is a reason to stop supervising game servers. A runner that refuses to start
+    /// because a monitoring endpoint could not bind has turned an observability feature into an
+    /// outage.</summary>
+    private static MetricsEndpoint? StartMetrics(Output output, RunnerConfig config,
+        InstanceSupervisor supervisor, string runnerId, DateTimeOffset startedAt, LauncherPaths paths,
+        int? portOverride, string? bindOverride, CancellationToken ct)
+    {
+        var port = portOverride ?? config.MetricsPort;
+        if (port <= 0)
+        {
+            output.Progress("metrics: disabled");
+            return null;
+        }
+
+        var bindText = bindOverride ?? config.MetricsBindAddress;
+        if (!IPAddress.TryParse(bindText, out var bind))
+        {
+            output.Progress($"metrics: '{bindText}' is not an address; no endpoint");
+            return null;
+        }
+
+        var endpoint = new MetricsEndpoint(bind, port,
+            () => RunnerMetrics.Render(supervisor, config, runnerId, startedAt, paths.Root));
+
+        try
+        {
+            endpoint.Start(ct);
+        }
+        catch (SocketException ex)
+        {
+            endpoint.Dispose();
+            output.Progress($"metrics: could not bind {bindText}:{port} ({ex.SocketErrorCode}); " +
+                            "no endpoint. Pick another with --metrics-port.");
+            return null;
+        }
+
+        output.Progress($"metrics: http://{bind}:{port}/metrics");
+        return endpoint;
+    }
+
     private static Command Status(Option<bool> jsonOption, Option<string?> rootOption)
     {
         var command = new Command("status", "show runner identity, link state and instances");
@@ -136,6 +209,8 @@ public static class RunnerCommands
                 conductor_url = config.ConductorUrl,
                 control_key_fingerprint = config.ControlKeyFingerprint,
                 granted_scopes = config.GrantedScopes,
+                web_token_prefix = config.WebToken?.Prefix,
+                metrics_url = MetricsUrl(config),
                 instances = store.Names(),
             };
 
@@ -150,12 +225,26 @@ public static class RunnerCommands
                 : "(not offering control)"));
             if (config.ControlKeyFingerprint is not null)
                 output.Line($"key           : {config.ControlKeyFingerprint[..16]}...");
+            // The prefix, never the token. Its absence is the answer to "why does the panel 401?".
+            output.Line($"panel token   : " + (config.WebToken is { } t
+                ? $"{t.Prefix}... (issued {t.IssuedAt:yyyy-MM-dd})"
+                : "(none; run `vortex runner new-token`)"));
+            output.Line($"metrics       : {MetricsUrl(config) ?? "(disabled)"}");
             output.Line($"instances     : {store.Names().Count}");
             return ExitCodes.Ok;
         });
 
         return command;
     }
+
+    /// <summary>What the running daemon would expose, from config alone. `runner status` is a separate
+    /// process from `runner run` and cannot ask it anything, so this is the configured endpoint rather
+    /// than a live one; --metrics-port on the daemon's command line overrides it and is not visible
+    /// here.</summary>
+    private static string? MetricsUrl(RunnerConfig config) =>
+        config.MetricsPort > 0
+            ? $"http://{config.MetricsBindAddress}:{config.MetricsPort}/metrics"
+            : null;
 
     private static Command Link(Option<bool> jsonOption, Option<string?> rootOption)
     {
@@ -316,6 +405,48 @@ public static class RunnerCommands
         return command;
     }
 
+    private static Command NewToken(Option<bool> jsonOption, Option<string?> rootOption)
+    {
+        var command = new Command("new-token",
+            "mint a new control plane token, invalidating the current one");
+
+        command.SetAction(parse =>
+        {
+            var output = new Output(parse.GetValue(jsonOption));
+            var paths = new LauncherPaths(parse.GetValue(rootOption));
+            var configStore = new RunnerConfigStore(paths);
+
+            var previous = configStore.Load().WebToken?.Prefix;
+            var token = configStore.IssueWebToken();
+
+            // No overlap window, unlike a Conductor API key. There is exactly one of these per box and
+            // one operator holding it, so "both work for an hour" buys nothing and leaves a live
+            // credential the operator believes they have already replaced.
+            return output.Ok(new { web_token = token, replaced_prefix = previous },
+                $"""
+                 {TokenBanner(token)}
+
+                 {(previous is null
+                     ? "This runner had no token; the panel was rejecting every request."
+                     : $"The previous token ({previous}...) stopped working just now. Anything using " +
+                       "it, including an open panel tab, has to be given the new one.")}
+                 The control plane picks this up without a restart.
+                 """);
+        });
+
+        return command;
+    }
+
+    /// <summary>The one place the token is ever rendered. Loud on purpose: this is the only moment it
+    /// exists outside the operator's clipboard, because only its hash is stored.</summary>
+    private static string TokenBanner(string token) =>
+        $"""
+         control plane token: {token}
+
+         !! Copy it now. It is stored hashed and will NOT be shown again. If it is lost, run
+         !! `vortex runner new-token` to mint another; there is no way to recover this one.
+         """;
+
     private static Command InstallService(Option<bool> jsonOption, Option<string?> rootOption)
     {
         var command = new Command("install-service",
@@ -326,6 +457,12 @@ public static class RunnerCommands
             var output = new Output(parse.GetValue(jsonOption));
             var paths = new LauncherPaths(parse.GetValue(rootOption));
             var exe = Environment.ProcessPath ?? "vortex";
+
+            // A box being set up as a service is the first moment there is an operator present to hand
+            // a credential to, which is why the token is minted here rather than on first boot of the
+            // web server, where nobody would be watching the output. Only when there is none already:
+            // re-running this to regenerate a unit file must not lock the operator out of their panel.
+            var token = new RunnerConfigStore(paths).EnsureWebToken();
 
             // KillMode=process is the whole point: stopping the runner must not stop the game servers
             // it supervises, because the next runner adopts them from their pidfiles.
@@ -351,9 +488,16 @@ public static class RunnerCommands
                 """;
 
             if (output.IsJson)
-                return output.Ok(new { systemd = unit, windows });
+                return output.Ok(new { systemd = unit, windows, web_token = token });
 
             output.Line(OperatingSystem.IsWindows() ? windows : unit);
+
+            // The banner goes to stderr, where Output.Progress puts it, so that
+            // `vortex runner install-service > vortex.service` writes a unit file and not a unit file
+            // with a live credential in it. It is still on the operator's terminal either way.
+            if (token is not null)
+                output.Progress(Environment.NewLine + TokenBanner(token));
+
             return ExitCodes.Ok;
         });
 

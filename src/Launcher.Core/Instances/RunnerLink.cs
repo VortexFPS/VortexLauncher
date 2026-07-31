@@ -11,7 +11,7 @@ namespace Launcher.Core.Instances;
 /// is why adding a verb here gives both planes the feature with no protocol change.</summary>
 public sealed class CommandDispatcher(
     InstanceSupervisor supervisor, BuildStore builds,
-    ContentFetcher? content = null, string? contentBaseUrl = null)
+    ContentFetcher? content = null, string? contentBaseUrl = null, string? conductorUrl = null)
 {
     public async Task<CommandResult> ExecuteAsync(CommandEnvelope command, ControlOrigin origin,
         CancellationToken ct)
@@ -42,6 +42,14 @@ public sealed class CommandDispatcher(
             return Error(command, ProtocolStatus.NotFound,
                 ApiError.Of(ApiErrorCodes.InstanceNotFound, ex.Message));
         }
+        catch (InstanceExistsException ex)
+        {
+            // 409 rather than the generic 400 below, because a panel has to be able to tell a taken
+            // name from a malformed spec: the first keeps everything the operator typed on screen with
+            // one field to fix, the second is a bug in whatever built the request.
+            return Error(command, ProtocolStatus.Conflict,
+                ApiError.Of(ApiErrorCodes.InstanceExists, ex.Message));
+        }
         catch (Exception ex)
         {
             return Error(command, ProtocolStatus.BadRequest,
@@ -55,10 +63,18 @@ public sealed class CommandDispatcher(
         var path = command.Path.StartsWith(ManagementProtocol.ApiPrefix, StringComparison.Ordinal)
             ? command.Path[ManagementProtocol.ApiPrefix.Length..]
             : command.Path;
+
+        // The envelope carries the whole request line, query string included, because a plane tunnels
+        // what it received rather than a parsed form of it. Routing is on the path alone; the
+        // parameters are read where they are used.
+        var mark = path.IndexOf('?');
+        if (mark >= 0)
+            path = path[..mark];
+
         var segments = path.Trim('/').Split('/');
 
         if (segments is ["agent" or "runner", "status"])
-            return (ProtocolStatus.Ok, RunnerSnapshot());
+            return (ProtocolStatus.Ok, Snapshot());
 
         if (segments is ["builds"])
             return (ProtocolStatus.Ok, builds.List().Select(b => new BuildSummary
@@ -71,6 +87,9 @@ public sealed class CommandDispatcher(
                 SizeBytes = builds.SizeOf(b),
                 InstalledAt = b.InstalledAt,
             }).ToList());
+
+        if (segments is ["content"])
+            return (ProtocolStatus.Ok, CachedContent());
 
         if (segments is ["instances"])
         {
@@ -109,10 +128,26 @@ public sealed class CommandDispatcher(
                 return (ProtocolStatus.Ok, instance.Status());
 
             case ("logs", _):
-                return (ProtocolStatus.Ok, instance.Tail(500));
+                return (ProtocolStatus.Ok, instance.Tail(TailLines(command.Path)));
 
             case ("audit", _):
                 return (ProtocolStatus.Ok, ReadAudit(name));
+
+            // server.cfg. A read in either mode, because the file is on the owner's own disk and
+            // being orchestrated hides nothing from them.
+            case ("config", "GET"):
+                return (ProtocolStatus.Ok, new ConfigDocument(supervisor.Store.LoadConfig(name)));
+
+            case ("config", "PATCH"):
+                // Absent text is refused rather than treated as an empty file: the two are
+                // indistinguishable once written, and one of them silently deletes the operator's
+                // config because a caller spelled the field wrong.
+                if (Body<ConfigDocument>(command) is not { Text: not null } document)
+                    throw new ArgumentException(
+                        """a server.cfg body is required, as {"text": "..."}""");
+
+                supervisor.WriteConfig(name, document.Text, origin);
+                return (ProtocolStatus.Ok, document);
 
             case (null, "PATCH"):
                 var patch = Body<InstanceSpec>(command)
@@ -184,15 +219,83 @@ public sealed class CommandDispatcher(
         }
     }
 
-    private RunnerStatus RunnerSnapshot() => new()
+    /// <summary>This runner and everything it owns.
+    ///
+    /// Public because the runner link's heartbeat sends the same thing: a plane's cached status and
+    /// the one it gets from asking must not be two different shapes assembled in two places, which is
+    /// exactly how conductor_url came to be set in neither.</summary>
+    public RunnerStatus Snapshot() => new()
     {
         RunnerId = RunnerIdentity.Current,
         Version = typeof(CommandDispatcher).Assembly.GetName().Version?.ToString(3) ?? "dev",
         Platform = PlatformKey.Current,
         Hostname = Environment.MachineName,
         StartedAt = DateTimeOffset.UtcNow,
+
+        // The Conductor this box actually dials, not the one it has an address for. A panel reads
+        // this to name the controlling plane from status alone, and an address with the opt-in
+        // switched off would name a plane that holds nothing.
+        ConductorUrl = conductorUrl,
+
         Instances = supervisor.All().Select(i => i.Status()).ToList(),
     };
+
+    /// <summary>How many lines /logs?tail=N answers with.
+    ///
+    /// Clamped rather than refused at both ends. Below one there is nothing to return, and above the
+    /// ring there is nothing to return either — a plane asking for more than the runner keeps means
+    /// all of it, and should not be able to size a list allocation from a URL.</summary>
+    private static int TailLines(string path) =>
+        Math.Clamp(IntQuery(path, "tail") ?? DefaultTail, 1, SupervisedInstance.LogRingLines);
+
+    private const int DefaultTail = 500;
+
+    /// <summary>One integer query parameter out of the envelope's path.
+    ///
+    /// Hand-read because Launcher.Core is BCL-only by rule and this is one number: pulling a web stack
+    /// into the runner to parse it would be the wrong trade. A parameter that is present but not a
+    /// number falls back to the default rather than failing the call, because a log read is not worth
+    /// refusing over a typo in a query string.</summary>
+    private static int? IntQuery(string path, string key)
+    {
+        var mark = path.IndexOf('?');
+        if (mark < 0)
+            return null;
+
+        foreach (var pair in path[(mark + 1)..].Split('&'))
+        {
+            var split = pair.IndexOf('=');
+            if (split < 0 || !pair.AsSpan(0, split).SequenceEqual(key))
+                continue;
+            return int.TryParse(pair[(split + 1)..], out var value) ? value : null;
+        }
+
+        return null;
+    }
+
+    /// <summary>What is in the shared content cache, by hash.
+    ///
+    /// Listing never opens an archive: the file name is the hash, which is the whole point of
+    /// addressing packages by their content. A package's name, its maps and where it was fetched from
+    /// are not recoverable from the cache, so they are left null rather than guessed — a plane that
+    /// wants them asks the store it fetched from.</summary>
+    private IReadOnlyList<ContentPackage> CachedContent()
+    {
+        if (content is null || !Directory.Exists(content.CacheDir))
+            return [];
+
+        return new DirectoryInfo(content.CacheDir)
+            .EnumerateFiles("*.pk3", SearchOption.AllDirectories)
+            .Select(f => new ContentPackage
+            {
+                Sha256 = Path.GetFileNameWithoutExtension(f.Name),
+                Name = f.Name,
+                SizeBytes = f.Length,
+                AddedAt = f.CreationTimeUtc,
+            })
+            .OrderBy(p => p.Sha256, StringComparer.Ordinal)
+            .ToList();
+    }
 
     private IReadOnlyList<string> ReadAudit(string name)
     {
@@ -218,6 +321,11 @@ public sealed class CommandDispatcher(
     };
 
     private sealed record ExecRequest(string Command);
+
+    /// <summary>The body of the server.cfg routes, in both directions. The whole file as one string:
+    /// it is a config the operator edits by hand in a text box, and anything structured here would be
+    /// the runner claiming to understand a file that belongs to the game.</summary>
+    private sealed record ConfigDocument(string Text);
 }
 
 /// <summary>The runner's outbound connection to a control plane.
@@ -368,19 +476,15 @@ public sealed class RunnerLink(
         {
             try
             {
+                // The dispatcher's own snapshot rather than a second one assembled here. A plane's
+                // cached copy is what its panel reads on nearly every screen, so a field the two
+                // shapes disagree on is a field that is null in the place people actually look. The id
+                // is the link's, because this frame is the link asserting who is speaking.
                 await SendAsync(new RunnerFrame
                 {
                     Kind = RunnerFrameKind.Status,
                     RunnerId = runnerId,
-                    Status = new RunnerStatus
-                    {
-                        RunnerId = runnerId,
-                        Version = typeof(RunnerLink).Assembly.GetName().Version?.ToString(3) ?? "dev",
-                        Platform = PlatformKey.Current,
-                        Hostname = Environment.MachineName,
-                        StartedAt = DateTimeOffset.UtcNow,
-                        Instances = supervisor.All().Select(i => i.Status()).ToList(),
-                    },
+                    Status = dispatcher.Snapshot() with { RunnerId = runnerId },
                 }, ct);
 
                 await Task.Delay(

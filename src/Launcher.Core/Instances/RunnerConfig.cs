@@ -16,6 +16,14 @@ public sealed record RunnerConfig
     /// local inbound exception would mean two auth models and two reconnect paths.</summary>
     public string? WebServerUrl { get; init; }
 
+    /// <summary>The master this box's servers announce to, or null for the one the game already points
+    /// at. Only self-hosters running their own directory need to set it.
+    ///
+    /// Null rather than a copy of the official address on purpose: the game's sv_master_url default is
+    /// the protocol's own, and restating it here would be a second place for it to drift. Nothing is
+    /// pinned at launch unless this says otherwise.</summary>
+    public string? MasterUrl { get; init; }
+
     /// <summary>Opt in to official orchestration. Sets available_for_control on every announce this
     /// box's servers send, which is what puts an offer in Conductor's adoption queue.</summary>
     public bool ConductorControl { get; init; }
@@ -30,12 +38,33 @@ public sealed record RunnerConfig
     /// ignores whatever a command claims for itself.</summary>
     public IReadOnlyList<string>? GrantedScopes { get; init; }
 
+    /// <summary>The bearer token for this box's own control plane, stored as a hash plus a short
+    /// clear prefix. Null on a runner that has never had one minted, which is what makes the panel
+    /// reject everything until `vortex runner install-service` or `vortex runner new-token` runs.
+    ///
+    /// The token itself is shown once and never written anywhere, so there is no recovery path other
+    /// than minting a new one. That is the point: a config file an operator can read the live token
+    /// out of is a config file a backup, a support bundle or a screen share leaks it through.</summary>
+    public RunnerWebToken? WebToken { get; init; }
+
     /// <summary>Where content packages are fetched from. Content-addressed, so this is normally the
     /// CDN in front of the store rather than the store itself.</summary>
     public string ContentBaseUrl { get; init; } = "https://master.vortexfps.org/content";
 
     public int PortPoolFirst { get; init; } = 26000;
     public int PortPoolLast { get; init; } = 26099;
+
+    /// <summary>Where the Prometheus scrape endpoint binds. Loopback by default: the numbers describe
+    /// how busy a host's servers are and how many of them there are, which is not something to publish
+    /// on every interface because a monitoring stack somewhere wants it.
+    ///
+    /// An operator scraping from another box changes this deliberately, and at that point the endpoint
+    /// is reachable by whatever else can reach that interface, which is the boundary the endpoint is
+    /// designed around (see <see cref="Metrics.MetricsEndpoint"/> for why there is no token).</summary>
+    public string MetricsBindAddress { get; init; } = "127.0.0.1";
+
+    /// <summary>Port for the scrape endpoint, or 0 to run no listener at all.</summary>
+    public int MetricsPort { get; init; } = Metrics.MetricsEndpoint.DefaultPort;
 }
 
 /// <summary>Loads and saves <see cref="RunnerConfig"/>, and owns the runner's identity keypair.
@@ -45,7 +74,9 @@ public sealed record RunnerConfig
 /// proves possession, and an attacker who replayed somebody else's fingerprint cannot.</summary>
 public sealed class RunnerConfigStore(LauncherPaths paths)
 {
-    private string ConfigPath => Path.Combine(paths.RunnerDir, "runner.json");
+    // Through RunnerLayout rather than composed here, because Launcher.WebServer reads this same file
+    // for the token hash and cannot reference this project to find out where it is.
+    private string ConfigPath => RunnerLayout.RunnerConfigPath(paths.Root);
     private string PrivateKeyPath => Path.Combine(paths.RunnerDir, "control-key.pem");
     private string PublicKeyPath => Path.Combine(paths.RunnerDir, "control-key.pub");
 
@@ -71,6 +102,24 @@ public sealed class RunnerConfigStore(LauncherPaths paths)
         File.WriteAllText(tmp, ManagementProtocol.Serialize(config));
         File.Move(tmp, ConfigPath, overwrite: true);
     }
+
+    /// <summary>Mint a control plane token, store its hash, and hand back the clear value.
+    ///
+    /// The caller has exactly one chance to show it. Nothing here keeps a copy, so a caller that
+    /// drops the return value has rotated the operator out of their own panel.</summary>
+    public string IssueWebToken()
+    {
+        var clear = RunnerToken.Issue();
+        Save(Load() with { WebToken = RunnerToken.Describe(clear) });
+        return clear;
+    }
+
+    /// <summary>Mint one only if this runner has none.
+    ///
+    /// Null means there already was one, and there is nothing to print: a stored hash cannot produce
+    /// the token back. Re-running an install must not silently invalidate the token the operator
+    /// already has in their password manager, so replacing an existing one is only ever explicit.</summary>
+    public string? EnsureWebToken() => Load().WebToken is null ? IssueWebToken() : null;
 
     /// <summary>Create the keypair if this box does not have one. ECDSA P-256: small keys, signatures
     /// that fit comfortably in a WS frame, and nothing exotic on either end.</summary>

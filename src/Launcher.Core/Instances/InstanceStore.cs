@@ -89,6 +89,32 @@ public sealed class InstanceStore(LauncherPaths paths)
 
     public bool Exists(string name) => File.Exists(PathsFor(name).SpecPath);
 
+    /// <summary>The instance's server.cfg as text, or empty when it has none.
+    ///
+    /// Empty rather than null: an instance created and never started has no file yet, and that is a
+    /// blank editor rather than an error to report.</summary>
+    public string LoadConfig(string name)
+    {
+        var path = PathsFor(name).ConfigPath;
+        return File.Exists(path) ? File.ReadAllText(path) : "";
+    }
+
+    /// <summary>Replace server.cfg with what the operator wrote.
+    ///
+    /// temp + move for the same reason <see cref="Save"/> does it, and a sharper one: this file
+    /// belongs to the operator rather than to the runner, and it is what the game executes at boot. A
+    /// truncating write interrupted by a crash or a full disk turns their config into an empty file
+    /// the server then comes up wrong from, with nothing to restore it from.</summary>
+    public void SaveConfig(string name, string text)
+    {
+        var instance = PathsFor(name);
+        instance.EnsureCreated();
+
+        var tmp = instance.ConfigPath + ".tmp";
+        File.WriteAllText(tmp, text);
+        File.Move(tmp, instance.ConfigPath, overwrite: true);
+    }
+
     /// <summary>Instance names become directory names and command-line arguments, so they are
     /// restricted rather than sanitized. Silently rewriting an operator's name would make
     /// `vortex server start x` fail to find the thing they just created.</summary>
@@ -134,6 +160,12 @@ public sealed class InstanceStore(LauncherPaths paths)
             // Structured event lines on stdout: joins, kills, votes, match boundaries and chat.
             // The runner parses these; turning it off blinds the dashboard and the chat view.
             sv_eventlog 1
+
+            // sv_public, sv_master_url, conductor_control and conductor_control_key are NOT set here.
+            // The runner pins them on the command line at every start, because the control key rotates
+            // and a copy in this file would go stale the moment it did. Those pins are applied after
+            // this file, so setting them here does nothing: set "listed" in instance.json to control
+            // whether this instance appears in the server browser.
 
             // Set a password and the runner can drive an adopted orphan whose stdin was lost.
             // rcon_password ""

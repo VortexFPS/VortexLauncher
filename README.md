@@ -22,6 +22,57 @@ Dev builds are NOT Velopack-installed, so self-update is inert (`UpdateManager.I
 guard) — everything else works, including real game installs into
 `%LOCALAPPDATA%/VortexArena/Launcher` (`~/.local/share/…` on Linux).
 
+## Nightly end-to-end
+
+`.github/workflows/nightly-e2e.yml` (03:17 UTC, plus `workflow_dispatch`) runs the published `vortex`
+binary through the sequence a new operator performs on day one, on a Linux runner against a scratch
+`--data-root`: put a build in the store, `server create`, `server start`, poll `server list --json`
+until the instance reports `running` on the map it was created with, `server exec` a `map` command and
+watch the new map come back out of the same getinfo probe, then `server stop` and check that the pid is
+gone, that nothing still holds the UDP port, and that the pidfile went with it. Every assertion reads
+`--json` through jq, which is what the JSON envelope and the exit codes are for. The unit suite covers
+each piece; this covers the seams, and the seams are where a fresh box fails.
+
+**It is red on the current code, and that is the finding.** The first run fails at `server start`, and
+the exec step after it fails for a second, unrelated reason. Both are in the runner, not in the
+workflow, and neither was worked around:
+
+- `SupervisedInstance.Cleanup()` deletes `instance.pid` unconditionally and `Dispose()` calls it, so
+  `vortex server start` deletes the pidfile of the child it just spawned as soon as the verb returns.
+  The server keeps running and keeps answering `getinfo`, but nothing can re-attach to it: the next
+  `vortex` invocation reports it `stopped` with no map, and `server stop` then returns `ok` while
+  leaking a process that still holds the port. The same deletion fires for an *adopted* instance, so on
+  a box running `vortex runner run`, one `vortex server list` destroys the daemon's ability to re-adopt
+  its servers after a restart — the thing `KillMode=process` in the generated unit file exists to make
+  possible.
+- `TryAdopt()` sets `_stdin = null` with the comment that commands go over rcon, and nothing goes over
+  rcon: `SendViaRconAsync` has no callers anywhere in the repo. So `server exec` against an instance
+  this process did not start fails `no_stdin` (exit 6), and the remediation the CLI prints — set
+  `rcon_password` in `server.cfg` — cannot help, because no code reads that password.
+
+Fixing either one alone does not turn the job green. The `if: failure()` step prints both, so a red run
+is read against them and a *new* failure is recognisable as new. Booting the server by some route no
+operator would take would have made this green and worth nothing.
+
+The server it boots is `tests/Launcher.FakeGameServer`, laid out in the scratch root the way an
+extracted release lands: `game/versions/<id>/<root>/VortexArena.x86_64`. No CLI verb registers a build,
+so the workflow leans on `BuildStore.List()` adopting a directory with no entry in `builds.json`, the
+same path that keeps an install made before that file existed from being orphaned; `vortex builds list`
+and `vortex builds pin` then confirm the store took it. There is no test-only hook in production code.
+
+Three things it deliberately leaves uncovered:
+
+- **The real game binary.** No Godot on a runner. The fixture implements the whole of the supervisor's
+  contract with a server (`--dedicated --port --userdir +map`, a UDP port answering `getinfo`, eventlog
+  lines on stdout, stdin for commands, an exit code) and nothing beyond it, so a green nightly says the
+  runner's lifecycle works, not that the game boots.
+- **Real downloads.** The nightly starts from a build already on disk. `vortex install`, the release
+  feed, checksum verification and signature checks are exercised in `tests/Launcher.Tests` with
+  `IDownloader` stubbed, so a broken `latest.json` or a hijacked `releases/latest` will not surface
+  here.
+- **Windows and macOS install paths.** `runs-on: ubuntu-latest`, and the Linux binary name is the only
+  one probed for. The macOS `ditto` extract path still has no machine in CI at all.
+
 ## Layout
 
 ```
@@ -46,12 +97,43 @@ cannot touch the box and every operation goes to a runner over the protocol.
 | Manifest | `src/Launcher.Core/Manifest.cs` | `latest.json` model (emitted by `tools/make-manifest.py` **in the game repo's** release job) |
 | Download | `src/Launcher.Core/DownloadService.cs` | resumable (Range), sha256-verified — refuses checksum-less files |
 | Install | `src/Launcher.Core/InstallService.cs` | staging extract → atomic move → `current.json` flip; keeps N-1 for rollback; shared content-addressed asset store for `-core` installs |
+| Extract | `src/Launcher.Core/ArchiveExtractor.cs` | `System.IO.Compression` on Windows/Linux; `ditto` on macOS, where the managed extractor drops the `.app`'s symlinks |
 | Launch | `src/Launcher.Core/GameLauncher.cs` | spawns the game; `--data <store>` for core installs (fat installs self-resolve) |
 | Artifact names | `src/Launcher.Core/LauncherConfig.cs` | the accepted release-artifact prefixes; see the rename note below |
 | Self-update | `src/Launcher.Desktop/SelfUpdateService.cs` | Velopack against this repo's releases |
 
 Invariants (ADR-0015 §6): never gate Play on the network; verify before swap; resume
 interrupted downloads; keep the previous version.
+
+## Runner metrics
+
+`vortex runner run` serves the Prometheus text format on `http://127.0.0.1:9877/metrics`:
+per-instance player and bot counts, CPU, memory, supervisor state, restart count and match state,
+plus runner-level counts, the link state and free disk. `--metrics-port 0` turns it off,
+`--metrics-bind` moves it off loopback, and both have `runner.json` equivalents.
+
+It sits on the runner and not on `Launcher.WebServer` because the runner is what has the numbers and
+the WebServer may not be running at all: a box under Conductor control never starts one, and a box
+under local control can have it stopped for an upgrade with forty players still connected. Metrics
+that vanish whenever the dashboard does are metrics nobody can alert on.
+
+The exporter is hand-written (`src/Launcher.Core/Metrics/`) rather than prometheus-net in
+`Launcher.Cli`, which was the other option, because `Launcher.Core` is BCL-only and
+`ArchitectureTests` fails the build on a `PackageReference` there. Three reasons it went that way and
+not the other:
+
+1. The numbers already live in Core. `SupervisedInstance.Status()` computes every series; a registry
+   in `Launcher.Cli` would be a second copy kept in step by a pump on a timer, and a scrape would then
+   report what the pump last saw rather than what the supervisor knows.
+2. The package brings no server the runner can use. `vortex` is a console app, so exposition would
+   arrive as either `KestrelMetricServer`, which drags the ASP.NET hosting stack into the binary a
+   *player* runs to launch the game, or `MetricServer` on `HttpListener`, which on Windows wants a URL
+   ACL. There is a listener to bind and harden either way.
+3. Nothing exported accumulates. Every series is a level read at scrape time, which is the one case
+   where a registry buys nothing.
+
+What that costs is the exposition format, which is one frozen spec, three escaping rules and a number
+format, and a single-route HTTP listener bound to loopback.
 
 ## The contract with the game repo
 
@@ -111,8 +193,28 @@ vpk pack -u VortexLauncher -v <ver> -p pub -e VortexLauncher.exe
 
 ## Known prototype gaps
 
-- macOS: `System.IO.Compression` doesn't restore symlinks, and the fat/core macOS zips contain
-  an `.app` with framework symlinks — the macOS install path needs `ditto`/`unzip` before it's real.
+- macOS install — **fixed**. Extraction runs through `IArchiveExtractor`
+  (`src/Launcher.Core/ArchiveExtractor.cs`), injected into `InstallService` the way `IDownloader` is:
+  `System.IO.Compression` still on Windows/Linux, `ditto -x -k` on macOS. `ditto` restores the symlinks
+  in the `.app`'s Frameworks dir — and the bundle's extended attributes — that the managed extractor
+  silently dropped. If `ditto` is missing or exits nonzero the install fails with a message naming it;
+  there is no fallback to the managed path, because that fallback is what produced an install that
+  looked complete and refused to launch. Residual gap: no Mac in CI, so that path has never run against
+  a real bundle.
 - No settings UI (channel pinning, install-root override) — `LauncherPaths` accepts an override, nothing exposes it.
-- Release notes render as plain text (no markdown).
-- Manifest signing (minisign) is the gate before this becomes the default install path — ADR-0015 cut list.
+- Release notes markdown — **fixed**. `MarkdownView` (`src/Launcher.Desktop/Controls/MarkdownView.cs`)
+  renders headings, emphasis, inline and fenced code, bullet and numbered lists, rules and links;
+  anything outside that list falls through as literal text, so a construct it does not know shows up
+  verbatim instead of disappearing. Hand-rolled rather than pulling in Markdown.Avalonia, because the
+  one behaviour that had to be constrained is the one that package gets wrong by default — its
+  hyperlink command shell-executes whatever URL the document carries. A release body is
+  attacker-influenced the moment the release process is, so every link goes through
+  `src/Launcher.Desktop/Controls/SafeLinkPolicy.cs`: `http`/`https` only, opened in the system browser,
+  `HyperlinkButton.NavigateUri` deliberately never set. Images render as alt text instead of being
+  fetched, which keeps a release body from beaconing the machines that display it. Residual gap: no
+  tables, block quotes or inline HTML.
+- Manifest signing (minisign) is the gate before this becomes the default install path — ADR-0015 cut
+  list. Half done: the launcher verifies a signature over `latest.json` when a release carries one
+  (`src/Launcher.Core/Signing/`), and refuses the release if that check fails. Nothing signs yet, so the
+  policy is verify-if-present and no release key is provisioned. `release-signing.md` has the
+  requirements for the game repo's release job and the order the two sides have to change in.

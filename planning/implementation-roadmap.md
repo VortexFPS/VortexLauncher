@@ -1,179 +1,319 @@
-# Implementation roadmap: game, Launcher, Conductor
+# Implementation roadmap: Launcher, Conductor, game
 
-**Status:** NEW 2026-07-30.
-**Scope:** sequencing across three repos. Task detail lives in `launcher-host-agent-plan.md` (A-series),
-`conductor-master-orchestrator-plan.md` (C-series), and the game repo's dedicated-server plan (DS-series).
+**Status:** rewritten 2026-07-30. Replaces the phase 0 to 5 plan, which described work that is now built.
+**Scope:** the state of `VortexFPS/VortexLauncher` and `VortexFPS/Conductor`, and everything still open.
 
-Sizes below are S/M/L relative shape, not a schedule. They exist to show which steps are one sitting and
-which are a week of somebody's attention, not to be added up into a date.
+Everything the old version of this file scheduled as phases 0 through 5 exists. A0 through A9 landed in
+two commits on the launcher's `feature/a0-a2-restructure`; C0 through C7 are the whole of Conductor's
+two-commit history. Both solutions build on net8.0 with no warnings. The A-series and C-series
+identifiers are retired, and open work uses the EXT/LNCH/COND/TEST/DOCS scheme in the second half of
+this document.
 
-## Where the three repos actually stand
+A follow-up batch has since landed LNCH-1, LNCH-2, COND-1, part of COND-2, and TEST-1. Those are marked
+**Landed** in place below rather than deleted, because the identifiers are cited in task lists and in
+other documents and a vanished ID reads as a lost requirement. None of that batch is committed yet: it
+is working-tree only in both repos, so a fresh clone of either branch still gets the state described in
+the paragraph above.
 
-| Repo | State |
+`launcher-host-agent-plan.md` and `conductor-master-orchestrator-plan.md` are still the place to find
+out *why* a thing is shaped the way it is. This file is for what state it is in.
+
+One thing to know before reading anything else: the launcher's entire build sits on
+`feature/a0-a2-restructure`, two commits ahead of `main` and unmerged. Clone `main` and you get the
+original single Avalonia project with three test files, which is also what `ci.yml` is building on every
+push to `main`.
+
+---
+
+## The shape of the system
+
+One runner per box, two control planes that talk to it as peers, and one public directory.
+
+```
+                    ┌──────────────────────────────┐
+  game servers ────►│   Conductor: master role     │◄──── players browse
+  announce, HTTPS   │   UDP getinfo challenge      │      GET /api/v1/servers
+                    └──────────────────────────────┘
+
+  ┌──────────────────────┐            ┌──────────────────────────────────┐
+  │  Launcher.WebServer  │            │  Conductor: orchestrator role    │
+  │  host owner's panel  │            │  adopted servers, RBAC, audit    │
+  └──────────┬───────────┘            └────────────────┬─────────────────┘
+             │      Launcher.Protocol over a socket    │
+             │      the runner dialed out on           │
+             └────────────────────┬────────────────────┘
+                                  ▼
+                       ┌─────────────────────────┐
+                       │  vortex runner          │  the only process
+                       │  instances, builds,     │  that touches the box
+                       │  content, supervision   │
+                       └────────────┬────────────┘
+                                    │  stdin, srcon, getinfo, eventlog
+                                    ▼
+                          game server processes
+```
+
+Four structural decisions hold that picture together, and none of them is obvious from the code alone.
+
+**`Launcher.WebServer` cannot reference `Launcher.Core`.** `tests/Launcher.Tests/ArchitectureTests.cs`
+reads the `.csproj` files off disk and fails the build if it does. That makes the rule a compile error
+rather than a convention, and it means the same-box case has no shortcut available to it. A panel that
+could read the build store directly when it happened to be local would grow a second code path that
+drifts from the remote one.
+
+**Runners always dial out, including to a plane on the same machine.** No community box opens an inbound
+port for this, and revoking a grant is something the host operator does locally without asking anyone.
+Making the local case an inbound exception would have produced two auth models and two reconnect stories.
+
+**Conductor is one application with two roles, switched by `Conductor:Roles` in config rather than by
+build.** Somebody self-hosting a directory with `sv_master_url` pointed at it must be able to turn the
+orchestrator off. A public server list has no business requiring fleet management to run.
+
+**An instance is `local` or `orchestrated`, never both and never a merged permission set.** Mutating
+calls from the wrong plane get a 409 whose body names the controlling plane and both exits, so a UI
+renders the banner without special-casing every endpoint that can produce one. The host owner keeps stop
+and release whatever the mode says, because it is their hardware.
+
+---
+
+## What is built
+
+### Two frozen protocols
+
+`Conductor/protocol/announce-v1.md` covers the game-to-master lane: the announce body, the UDP challenge
+sequence, TTL and expiry, the browse query, and `available_for_control` plus `control_key_fingerprint`
+for offering a box to orchestration. Frozen, additive changes only. `Conductor.Protocol` implements it
+and `tests/Conductor.Tests/fixtures/` holds golden JSON for every message in the spec, meant to be shared
+with the game repo so a DTO edited in one place fails the other two rather than reaching production as a
+field-name disagreement.
+
+`VortexLauncher/protocol/runner-api-v1.yaml` is the plane-to-runner contract, OpenAPI 3.1, 473 lines.
+Both `Launcher.WebServer` and Conductor code against it, which is why adding a verb there gives both of
+them the feature with no further protocol work. The same operations travel two ways: over HTTP to a
+browser, and tunneled inside a `CommandEnvelope` over the runner link. The runner implements them once,
+in `CommandDispatcher`.
+
+### VortexLauncher
+
+| Project | What it holds |
 |---|---|
-| `VortexFPS/VortexArena` | DS-1 through DS-6 and DS-8 landed on `feature/dedicated-server-v2`. Dedicated host, stdin console, srcon, tick-matched loop, signals and exit codes, `server.cfg`, eventlog with chat lines, ban persistence. DS-7 (modern announce) is the only open item and it is blocked, not skipped |
-| `VortexFPS/VortexLauncher` | 2 commits. One Avalonia project (`XonoticGodot.Launcher`, net8.0, Avalonia 11.3.18, Velopack 1.2.0) whose `Core/` folder already holds the feed, download, checksum, install, and manifest code. One test project with 3 test files |
-| `VortexFPS/Conductor` | Does not exist |
+| `src/Launcher.Protocol` | Instance DTOs, command envelope, control modes and events, scopes, `ApiError`. BCL only, no project references, packable |
+| `src/Launcher.Core` | Release feeds with the GitHub API fallback, resumable sha256-verified download, install with atomic swap and N-1 rollback, the side-by-side build store, `GameControl` (srcon, getinfo, MD4, eventlog parsing), `Instances` (store, supervisor, content fetch, runner link), `SourceProvider`. BCL only |
+| `src/Launcher.Cli` | The `vortex` binary, which is also the runner daemon. `install`/`update`/`launch`, `builds list\|pin\|gc`, `server create\|list\|start\|stop\|restart\|delete\|console\|exec\|release`, `runner run\|status\|link\|unlink\|rotate-key\|install-service` |
+| `src/Launcher.WebServer` | The host owner's panel. Bearer auth on everything including the WebSocket upgrade, loopback binding by default, the runner link endpoint, proxy routes, live-console socket, `wwwroot/` |
+| `src/Launcher.Desktop` | The Avalonia player launcher, with Velopack for its own updates. Calls Core for feed, install and launch |
+| `tests/Launcher.Tests` | Eight files: checksum, manifest, install lifecycle, artifact naming, game control, runner, web server, architecture |
 
-## The two chains
+The CLI and Desktop reach the player path through the same `InstallService` calls, so the CLI doubles as
+the integration surface for it. One binary is what a host operator installs, versions and packages,
+whether they are typing verbs or running `vortex runner run` under systemd. `install-service` prints a
+unit with `KillMode=process` on purpose: stopping the runner must not stop the game servers it
+supervises, because the next runner adopts them from their pidfiles.
 
-Work splits into two mostly independent chains that meet once, at Orchestrator MVP.
+### Conductor
 
-```
-directory chain:   C0 announce freeze → C1 Master MVP → DS-7 game announce → C2 public list
-                                                \
-control chain:  A0 restructure → A1 core+CLI → A2 instances → A3 protocol freeze → A4 WebServer
-                                                                          \        /
-                                                                       C3 Orchestrator MVP → C4 alerts
-```
+`Conductor.Protocol` is the announce protocol as code, BCL only and referencing nothing else in the repo.
+A package that dragged server internals into the game's build would be a worse seam than a duplicated
+DTO.
 
-Nothing in the control chain waits on the directory chain until C3, and the directory chain never waits on
-the control chain at all. Two people can run these in parallel from day one.
+`Conductor.Server` is the whole service, one ASP.NET application, four folders:
 
----
+- **`Master/`** takes announces, applies per-address rate limits with `Retry-After`, per-host server
+  caps, listing bans and hostname sanitization; `ChallengeVerifier` sends the UDP `getinfo` challenge as
+  a hosted service and `ExpirySweeper` ages rows out; `ServerDirectory` serves the browse query with
+  filters, ETag and cursor paging. Nothing lists until the challenge comes back, which is what makes a
+  listing mean something, and it needs no new game-side code because the responder that answers it is
+  already in production.
+- **`Orchestrator/`** holds `RunnerHub` (the socket, command correlation), adoption (queue, accept,
+  decline, signed enrollment, key rotation, revoke), alerting with the lost-contact split and a
+  `LinkWatchdog`, the content store with `.pk3` validation that refuses traversal entries and extreme
+  compression ratios, and staged wave updates in `FleetOperations`.
+- **`Auth/`** issues API keys stored hashed, rotates them with an overlap window, and enforces
+  viewer/operator/owner roles. An empty database mints one owner key and logs it once, so there is no
+  shared token sitting in a config file.
+- **`Data/`** is EF Core over SQLite for development and self-hosters, Postgres in production.
 
-## Phase 0: unblock everything (no dependencies)
+`deploy/` has a Dockerfile and a compose file with Postgres, a `BehindReverseProxy` switch, and comments
+pointing `master.vortexfps.org` and `conductor.vortexfps.org` at one deployment. Nothing is running
+anywhere yet.
 
-**A0. Restructure the launcher repo.** (M)
+Five test files cover announce handling, the browse query, auth and RBAC, the adoption handshake, content
+validation, and the golden fixtures.
 
-The existing tree maps onto the target layout almost directly, which makes this mechanical rather than a
-rewrite.
+### Decisions that are settled
 
-1. Add `VortexLauncher.sln`, `src/`, and `tests/`.
-2. New class library `src/Launcher.Core/` (net8.0, no package references). Move in from
-   `XonoticGodot.Launcher/Core/`: `ChecksumFile`, `DownloadService`, `InstallService`, `LauncherConfig`,
-   `Manifest`, `PlatformKey`, `ReleaseFeeds`, `GameLauncher`.
-3. Leave `SelfUpdateService` behind in the Avalonia project. It depends on Velopack, and Core is BCL-only by
-   the dependency rule. Launcher self-update is a Desktop concern, not a shared one.
-4. Move the Avalonia shell (`App.axaml`, `Program.cs`, `ViewModels/`, `Views/`) to `src/Launcher.Desktop/`.
-5. Move the test project to `tests/Launcher.Tests/` and add the architecture test that enforces the
-   dependency graph. Write it now, while there are only two projects to satisfy it.
-6. Rename `XonoticGodot*` to the Vortex naming through project files, namespaces, and `AssemblyName`.
-   Update `Directory.Build.props` and `.github/workflows/ci.yml` to match.
-
-Done when: solution builds, the 3 existing tests pass, the architecture test passes, and CI is green.
-
-**C0. Freeze announce v1.** (S, paper only)
-
-Write `protocol/announce-v1.md` covering the request body from `conductor-master-orchestrator-plan.md` §2,
-including `available_for_control` and `control_key_fingerprint`, the challenge sequence, TTL semantics, and
-the browse query and response. Publish `Conductor.Protocol` from it. No service code yet.
-
-It is small, it is paper, and it unblocks two separate teams at once. Do it first.
-
-**Decisions, both answered 2026-07-30:**
-
-- Map package format is `.pk3`, carrying either a legacy `.bsp` or a `.vmap` with its caches. C5 and A7
-  are unblocked; the validation rules that follow from it are in
-  `conductor-master-orchestrator-plan.md` §5.
-- Hostnames are `master.vortexfps.org` for the announce protocol and `conductor.vortexfps.org` for the
-  panel, one deployment behind both. C2 is unblocked on everything except who operates it.
-
-## Phase 1: the player path and the directory
-
-**A1. Core plus the CLI player path.** (M) Depends on A0.
-
-New `src/Launcher.Cli/` with `vortex install`, `update`, and `launch` over Core. Build store lands here:
-side-by-side versioned directories, sha256 verify, GC, rollback. Desktop reaches feature parity by calling
-Core rather than its own copies.
-
-Carry forward the ADR-0015 lesson rather than rediscovering it: GitHub's `releases/latest` ignores
-prereleases, so the API-fallback feed is the only path that works today. Keep both feed sources and keep the
-fallback exercised in tests.
-
-**C1. Master MVP.** (L) Depends on C0.
-
-`Conductor.Server` with announce intake, the UDP challenge verifier, TTL expiry, `GET /servers`, per-IP rate
-limits and server-count caps, Postgres and SQLite via EF Core, and a docker deploy. Ship the two integration
-tests from the plan with it: a container that announces and lists and expires, and a spoofed announce with no
-UDP responder that must never appear.
-
-**A2. Server instances, CLI only.** (L) Depends on A1. Game side is already landed.
-
-Instance model, supervisor, orphan adoption, port pool, `vortex server *`, the three control paths, health
-checks and flap detection, eventlog parsing including the four chat variants. This is the first genuinely
-useful milestone for an operator: a headless box with real server management and no web surface at all.
-
-Land the runner half of control modes here too, while the code is fresh: `control_mode` in `instance.json`,
-`vortex server release`, and the control-event payload. The runner can enforce a mode it is the only client
-of long before a second control plane exists.
-
-## Phase 2: connect the game to the directory
-
-**DS-7. Modern announce, game side.** (M) Depends on C0 and C1.
-
-In the game repo, on its own branch off `feature/dedicated-server-v2`, coded against `Conductor.Protocol`.
-Announce client on a worker thread beside the existing heartbeat, `sv_master_url` cvar, `sv_public 0`
-disabling both lanes. Then the menu browser sources `GET /servers` while keeping the direct-getinfo ping path
-untouched, plus the `server-browser-master` parity unit.
-
-**C2. Public list live.** (S) Depends on DS-7 and the domain decision.
-
-Hosted instance, public beta list, CDN in front of the browse endpoint.
-
-**A3. Freeze `Launcher.Protocol`.** (M) Depends on A2.
-
-Write the OpenAPI spec and the WS message schema from the instance operations A2 proved out, publish the
-package. Freezing before A2 would mean guessing at the shape; freezing after A4 would mean Conductor coding
-against a moving implementation.
-
-## Phase 3: the control plane
-
-**A4. WebServer and web MVP.** (L) Depends on A3.
-
-`src/Launcher.WebServer/` with outbound runner links, bearer auth on every request including the WS upgrade,
-the REST and WS surface, the SPA in `web/`, dashboard, live console, and service install. The architecture
-test already forbids the Core reference; keep it that way when the first "just read the file directly"
-temptation shows up.
-
-**A6. Control modes, WebServer half.** (M) Depends on A4.
-
-The `409 instance is orchestrated` contract on every mutating endpoint, the banner with scopes and audit
-link, both exit buttons, and the read-only config and log views. The runner half already exists from A2.
-
-**A5. Update, drain, rollback, metrics.** (M) Depends on A4. Independent of A6; either order.
-
-## Phase 4: orchestration
-
-**C3. Orchestrator MVP.** (L) Depends on A3 and C1.
-
-Adoption queue fed by `available_for_control` announces, accept flow with scope selection, WS hub, key
-handshake, command proxy over `Launcher.Protocol`, RBAC, audit. Build the fake-runner harness first; every
-later test in this phase needs it.
-
-**A9. Runner link.** (M) Pairs with C3.
-
-`conductor_control` and `conductor_url` config, keypair generation and storage, `vortex runner link` and
-`unlink`, outbound WSS with the fingerprint handshake.
-
-**C4. Control-event ingest and alerts.** (M) Depends on C3 and A6.
-
-Severity rules, the lost-contact split, per-operator history in the adoption queue. Test the mid-match
-critical path and the killed-connection path explicitly; they are the two cases the design exists for.
-
-## Phase 5: content and fleet operations
-
-**C5 plus A7. Content store and fetch.** (L) Blocked on the map package format decision from Phase 0.
-
-Upload with validation, sha256 storage, CDN, assignment commands, client distribution URLs on the Conductor
-side. Fetch-by-hash, second-pass validation, quotas on the runner side. Do not start either half until the
-package format is settled; every validation rule depends on it.
-
-**C6. Fleet ops.** (L) Bulk and staged updates with canary-then-wave, config templates, scheduled tasks,
-monitoring dashboards.
-
-**A8. SourceProvider.** (L) git clone and compile pipeline, toolchain cache, repo and branch picker.
-Independent of everything in Phases 3 and 4; slot it wherever there is capacity.
-
-**C7. Hardening and scale.** (M) Multi-region master, key rotation, pen test against both protocols.
+Map packages are `.pk3` carrying either a legacy `.bsp` or a `.vmap` with its caches, which is what every
+validation rule in the content store and the runner's fetcher is written against. `master.vortexfps.org`
+serves the announce protocol and is the `sv_master_url` default; `conductor.vortexfps.org` serves the
+panel; one deployment answers both, under two names so they can carry different cache, WAF and rate-limit
+policy and so the panel can go down without the server list following it.
 
 ---
 
-## What to do first
+## What is left
 
-If one person is starting Monday: C0, then A0. C0 is a document that unblocks the game repo and the whole
-directory chain, and A0 turns a single Avalonia project into the structure everything else assumes. Neither
-depends on anything that does not already exist.
+The old two-chains framing still earns its place, but it now means something different. The chains no
+longer meet at a code milestone, because that milestone landed. They now describe two things that can
+ship on separate dates: a public server list, and people operating servers through a panel. Nothing in
+the first waits on the second.
 
-If two people: one takes C0 into C1 and stays on Conductor; the other takes A0 into A1 and A2 and stays on
-the launcher. They do not need to talk again until A3.
+**Shortest path to a public list:** finish COND-2, then EXT-1, then EXT-2. One link in the old chain is
+gone: COND-2's workflow packs `Launcher.Protocol` from a launcher checkout into a runner-local feed, so
+Conductor's CI restores today without LNCH-3 and without a sibling tree. What is still forced is the
+other half, because the game cannot reference `Conductor.Protocol` until something publishes it, and
+nothing does yet. TEST-6 wants to land before anyone trusts the list, because it is the only thing that
+would prove a spoofed announce stays off it.
+
+**Shortest path to usable orchestration:** COND-3, then LNCH-4. The two that used to come first are
+done: a runner mints its own panel token, and the remote-binding switch now refuses to start rather
+than quietly exposing the API. What is left in this chain is entirely UI.
+
+### EXT: outside these two repos
+
+**EXT-1. Apply the DS-7 announce client to the game repo.** `planning/ds-7/` holds a finished change set
+(`MasterAnnounce.cs`, a README with six apply steps) for `VortexFPS/VortexArena`. It was written out
+instead of committed because another agent had eight worktrees open on `feature/dedicated-server-v2` on
+2026-07-30. Applying it means taking one file in, registering `sv_master_url` and `conductor_control`,
+driving `Tick()` from wherever the dpmaster heartbeat is driven, and sourcing the menu browser from
+`GET /api/v1/servers`. The classic dpmaster lane is untouched.
+
+**EXT-2. Deploy Conductor to OVH.** `deploy/` builds and composes; nothing has ever run. This needs a
+host, TLS termination in front (the app returns a hard 426 on plaintext rather than redirecting, so an
+announce client never learns that http works), DNS for both hostnames, a CDN over the browse endpoint and
+`/content`, and someone to own the box. Who operates it is still an open question, not a technical one.
+
+**EXT-3. Security review, deferred to post-beta.** A pen test against both protocols, plus key rotation
+practice for Conductor's own keys and whatever multi-region story the master needs. Deferred on purpose:
+reviewing a service nobody has deployed tells you about the code and not about the deployment.
+
+### LNCH: the launcher repo
+
+LNCH-1 through LNCH-6 are the server side, roughly in the order somebody trying to use it would hit them.
+The last three are the player-facing launcher, which is still the prototype ADR-0015 describes.
+
+**LNCH-1. Issue the WebServer's bearer token. Landed.** The contract won, as it should have:
+`install-service` now mints a token when the box has none and prints it once to stderr, so redirecting
+the command still writes a unit file rather than a unit file with a live credential in it.
+`vortex runner new-token` rotates it with no overlap window, there being one operator and one token.
+`WebServerOptions` no longer carries a plaintext token at all; `RunnerTokenStore` reads the hash out of
+the runner's own `runner.json`, which is what lets a rotation take effect without restarting the panel.
+
+**LNCH-2. Make the remote-binding switch mean something. Landed.** `BindingGate.Evaluate` runs before
+Kestrel binds and refuses to start unless `AllowRemoteBinding` is paired with either a certificate this
+process serves or an explicit `BehindReverseProxy` assertion. It exits 78 (`EX_CONFIG`) so a unit file
+can set `RestartPreventExitStatus=78` and get one loud stop instead of a crash loop burying the reason.
+Refusing rather than warning was the deliberate call: nobody reads the startup log of a service that
+came up fine.
+
+**LNCH-3. Publish `Launcher.Protocol` to a feed.** `Conductor.Server.csproj` falls back to
+`PackageReference Include="Launcher.Protocol" Version="1.0.0"` when the sibling checkout is missing, and
+that package does not exist anywhere. CI no longer waits on this, because COND-2's workflow packs the
+project itself into a local feed, but a developer who clones Conductor alone still cannot restore it
+without also cloning the launcher.
+
+**LNCH-4. Build out the panel.** `wwwroot/index.html` is 104 lines: a status table and the orchestration
+banner with its two buttons. The live console socket, instance creation, build management, drain, and the
+CPU and memory the runner already reports each have a working API route and no UI in front of them.
+
+**LNCH-5. Let the CLI edit an instance.** `vortex server` can create, list, start, stop, restart, delete,
+tail, exec and release, and there is no verb that changes an existing spec, so switching a map, a port or
+a build means hand-editing `instance.json` or curling the API. Drain has the same problem from the other
+direction: the supervisor implements it and the runner API exposes it, and no subcommand reaches it.
+
+**LNCH-6. Give `SourceProvider` an entry point.** 351 lines that clone a repo, run the toolchain, and
+stage the result into the same build store downloaded releases land in, so pin and rollback behave
+identically for both. No CLI verb and no runner API route calls any of it, so it is currently
+unreachable code.
+
+**LNCH-7. Sign manifests with minisign.** ADR-0015 names this as the gate before launcher-managed
+installs become the default path. Until it exists, install integrity rests on sha256 values fetched from
+the same place as the files they describe.
+
+**LNCH-8. Close the player-launcher gaps.** `System.IO.Compression` does not restore symlinks and the
+macOS zips contain an `.app` with framework symlinks, so the macOS install path needs `ditto` or `unzip`
+before it is real. There is also no settings UI (`LauncherPaths` accepts an install-root override that
+nothing exposes, and channel pinning has no control), release notes render as plain text, and Desktop
+talks to `InstallService` without ever touching `BuildStore`, so a player cannot pin or roll back from
+the UI while the CLI can do both.
+
+**LNCH-9. Package the launcher in CI.** The Velopack `publish` and `vpk pack` commands are written down
+in the README and no workflow runs them, so the launcher cannot ship its own updates.
+
+### COND: the Conductor repo
+
+**COND-1** is migrations. **Landed.** There is an `InitialCreate` migration with its model snapshot, a
+design-time `ConductorDbFactory`, and `Program.cs` now calls `MigrateAsync()` on Postgres. SQLite keeps
+`EnsureCreatedAsync()` and is therefore still never migrated, which is a stated cost rather than an
+oversight: it is the development and self-hosting database, and the comment at the call site says so.
+Production is the half that had no upgrade path, and now has one.
+
+**COND-2** is CI. **Partly landed.** `.github/workflows/ci.yml` builds and tests the solution on every
+push and pull request, and asserts that `Directory.Build.props` still sets `Nullable` and
+`ImplicitUsings`, the second of which would otherwise fail silently and stop checking the annotations
+`Conductor.Protocol` uses to state which announce fields are optional. It resolves `Launcher.Protocol`
+by checking the launcher out under a name that is deliberately not the sibling path the csproj probes
+for, then packing it into a local feed, so the run exercises the package fallback that a clone of this
+repo alone would take rather than the developer path every local build already covers. Still missing the
+piece EXT-1 waits on: nothing publishes `Conductor.Protocol` anywhere. The golden fixtures are asserted
+by the test step, `GoldenFixtureTests` being part of the suite.
+
+**COND-3** is the orchestrator panel. `conductor.vortexfps.org` is named in the compose file, the README
+and the announce spec, and there is no HTML behind it. Adoption, alerts, fleet operations, content and
+audit are all complete as API; nothing renders them, so accepting a server today means a hand-written
+POST.
+
+**COND-4** is the map catalog. `Conductor/protocol/map-catalog-v1.md` is a finished 206-line spec, still
+untracked in git, with no code on either side. It lets players browse and download the maps a server
+actually carries, keyed by package hash so four hundred servers running the same forty maps cost the
+master one copy. Steady state is 64 extra bytes on an announce that already happens.
+
+**COND-5** is a moderation surface for the public list. `ListingBan` is in the schema and checked on every
+announce, and nothing creates, lists or lifts one. Removing an abusive server from the directory currently
+means running SQL against production.
+
+**COND-6** is the dpmaster UDP question, still open from the C1 plan. A thin UDP frontend would let stock
+DarkPlaces-derived clients browse us, which is cheap to add and pulls legacy parsing into the service.
+The plan leaned yes and deferred the call; it is still deferred.
+
+### TEST: coverage the plans call for and the repos do not have
+
+Both plan documents specify a test suite that the code does not yet have. The two repos have 13 test
+files between them, all unit-level: nothing starts a process, nothing stands up an HTTP host, and nothing
+exercises the UDP challenge. TEST-1 has since landed, which unblocks the first two of those but does not
+by itself close any of them.
+
+- **TEST-1. `Launcher.FakeGameServer`. Landed.** A real process the supervisor can spawn: it answers
+  getinfo and status over UDP, takes console commands on stdin, writes eventlog lines to stdout, and
+  binds `--port 0` while reporting the port it actually got, so tests do not have to guess a free one.
+  The failure modes the supervisor exists to handle are scriptable through `FAKE_*` environment
+  variables: `FAKE_CRASH_AFTER_MS` for restart policy and flap detection, `FAKE_HANG` for the case that
+  separates liveness from process death, holding the port while answering nothing. It is in the
+  solution and builds. TEST-2 and TEST-4 are now unblocked rather than done.
+- **TEST-2. Supervisor integration.** `InstanceSupervisor` and `SupervisedInstance` are about 925 lines
+  covering restart policy, flap detection, drain, orphan adoption and reading the real bind line out of
+  stdout, with no test that starts a process.
+- **TEST-3. Finish the control-mode matrix.** The 409 cases are covered in `RunnerTests`. The two cases
+  the design exists for are not: both exits working with the controlling plane deliberately unreachable,
+  and the control event being emitted before the action rather than after it.
+- **TEST-4. Adoption harness.** Offer, accept, handshake, wrong-key rejection, revocation, and command
+  queueing while a runner is offline.
+- **TEST-5. Contract tests against `runner-api-v1.yaml`.** The spec is what Conductor codes to, and
+  nothing currently asserts that the runner matches it.
+- **TEST-6. Master integration.** A container that announces, gets challenged, lists, then TTL-expires,
+  plus a spoofed announce with no UDP responder that must never appear. `ChallengeVerifier` runs as a
+  hosted service and no test starts it, so the anti-spoof property the whole directory rests on is
+  currently unverified.
+- **TEST-7. Nightly end-to-end on Linux.** Download a release, create an instance, boot it, query it,
+  stop it. That is what a fresh operator does on day one.
+- **TEST-8. Load test `GET /api/v1/servers`** with k6, under CDN-miss assumptions. It is the only hot
+  public endpoint.
+
+### DOCS: the repo front doors
+
+**DOCS-1. Bring the READMEs up to the code.** Conductor's says "C0 complete", "Nothing is deployed" and
+"`Conductor.Server` does not exist yet", then lists a three-entry layout; the server, the auth stack, the
+orchestrator and the deploy files all landed in the same commit range. The launcher's says
+`Launcher.Cli` and `Launcher.WebServer` "land in A1 and A4" as future work, and both shipped.
+`planning/README.md` still describes Conductor as a repo that does not exist. A newcomer reading either
+README gets a picture roughly two commits stale, which is the same failure this file was rewritten to
+fix.

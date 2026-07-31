@@ -1,4 +1,3 @@
-using System.IO.Compression;
 using System.Text.Json;
 
 namespace Launcher.Core;
@@ -15,11 +14,17 @@ public sealed record InstalledState(
 
 /// <summary>Game-install lifecycle (ADR-0015 §3/§6): download → verify → extract to staging →
 /// move into versions/ → flip current.json. Previous version is retained for rollback.</summary>
-public sealed class InstallService(LauncherPaths paths, IDownloader downloader, BuildStore? builds = null)
+public sealed class InstallService(LauncherPaths paths, IDownloader downloader,
+    BuildStore? builds = null, IArchiveExtractor? extractor = null)
 {
     /// <summary>Side-by-side builds, pin and GC. Defaulted rather than required so the existing
     /// two-argument construction keeps working.</summary>
     public BuildStore Builds { get; } = builds ?? new BuildStore(paths);
+
+    /// <summary>Managed on Windows/Linux, ditto on macOS — the macOS package is an .app bundle whose
+    /// symlinks the managed extractor silently drops. Injectable, like the downloader, so the macOS
+    /// decision is testable on a machine that isn't a Mac.</summary>
+    private readonly IArchiveExtractor _extractor = extractor ?? ArchiveExtractor.ForCurrentPlatform();
 
     public InstalledState? LoadCurrent()
     {
@@ -80,7 +85,7 @@ public sealed class InstallService(LauncherPaths paths, IDownloader downloader, 
         var extractDir = Path.Combine(paths.StagingDir, "extract-" + manifest.Version);
         if (Directory.Exists(extractDir))
             Directory.Delete(extractDir, recursive: true);
-        await Task.Run(() => ZipFile.ExtractToDirectory(zipPath, extractDir), ct);
+        await _extractor.ExtractAsync(zipPath, extractDir, ct);
 
         var root = file.Root ?? FindSingleRootDir(extractDir);
         if (!Directory.Exists(Path.Combine(extractDir, root)))
@@ -119,7 +124,7 @@ public sealed class InstallService(LauncherPaths paths, IDownloader downloader, 
         var tmp = storeDir + ".staging";
         if (Directory.Exists(tmp))
             Directory.Delete(tmp, recursive: true);
-        await Task.Run(() => ZipFile.ExtractToDirectory(zipPath, tmp), ct);
+        await _extractor.ExtractAsync(zipPath, tmp, ct);
         Directory.CreateDirectory(paths.AssetStoreDir);
         if (Directory.Exists(storeDir))
             Directory.Delete(storeDir, recursive: true);

@@ -8,8 +8,29 @@ var builder = WebApplication.CreateBuilder(args);
 
 var options = new WebServerOptions();
 builder.Configuration.GetSection("WebServer").Bind(options);
+
+// Ahead of builder.Build() on purpose: a configuration that would expose the management API never gets
+// as far as constructing the server that would expose it. See BindingGate for why this refuses rather
+// than warning.
+var binding = BindingGate.Evaluate(options);
+if (binding.Refusal is not null)
+{
+    Console.Error.WriteLine(binding.Refusal);
+    return BindingGate.ConfigExitCode;
+}
+
+// Listening in code rather than through Urls/ASPNETCORE_URLS is deliberate: endpoints defined here
+// take precedence, so no stray environment variable can quietly move this endpoint back to plaintext
+// after the certificate is what allowed it off loopback in the first place.
+if (binding.Certificate is not null)
+    builder.WebHost.ConfigureKestrel(kestrel => kestrel.Listen(
+        options.AllowRemoteBinding ? IPAddress.Any : IPAddress.Loopback,
+        ManagementProtocol.DefaultWebServerPort,
+        listen => listen.UseHttps(binding.Certificate)));
+
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton<RunnerRegistry>();
+builder.Services.AddSingleton<RunnerTokenStore>();
 
 builder.Services.ConfigureHttpJsonOptions(json =>
 {
@@ -21,10 +42,12 @@ builder.Services.ConfigureHttpJsonOptions(json =>
 
 var app = builder.Build();
 
-// Loopback unless told otherwise, and told otherwise means a deliberate setting plus TLS or a
-// documented proxy. A management panel with a bearer token on a public interface is the failure this
-// prevents, and it is the kind that is only noticed afterward.
-if (!options.AllowRemoteBinding)
+// The default, unchanged and needing no configuration: plain HTTP on loopback only. A certificate,
+// when there is one, has already claimed the endpoint above. Remote binding without a certificate got
+// past the gate by declaring a reverse proxy, and where that proxy expects to reach this process
+// (a private interface, or loopback with nginx on the same box) is the operator's business, so that
+// case is left to ASPNETCORE_URLS rather than guessed at here.
+if (!options.AllowRemoteBinding && binding.Certificate is null)
     app.Urls.Add($"http://127.0.0.1:{ManagementProtocol.DefaultWebServerPort}");
 
 app.UseWebSockets();
@@ -34,6 +57,10 @@ app.UseStaticFiles();
 // Health is the only unauthenticated endpoint. Everything else, including the WebSocket upgrade,
 // carries the bearer token; an upgrade that skipped auth would be a hole shaped exactly like the API.
 app.MapGet("/healthz", () => Results.Ok(new { ok = true }));
+
+// Resolved once: the store is a singleton, and the alternative is a service-locator call on every
+// request for something whose whole job is to be cheap enough to do on every request.
+var tokens = app.Services.GetRequiredService<RunnerTokenStore>();
 
 app.Use(async (context, next) =>
 {
@@ -45,11 +72,13 @@ app.Use(async (context, next) =>
         return;
     }
 
-    if (!Authorized(context, options))
+    if (!Authorized(context, tokens))
     {
         context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-        await context.Response.WriteAsJsonAsync(
-            ApiError.Of(ApiErrorCodes.Unauthorized, "bearer token required"));
+        // The remedy is named because the common cause of this is a box nobody has minted a token on
+        // yet, and an operator has no way to guess where one comes from.
+        await context.Response.WriteAsJsonAsync(ApiError.Of(ApiErrorCodes.Unauthorized,
+            "bearer token required; `vortex runner new-token` mints one"));
         return;
     }
 
@@ -159,8 +188,12 @@ app.Map("/api/v1/instances/{**path}", async (string? path, HttpContext http,
         body = await reader.ReadToEndAsync(ct);
     }
 
+    // Query string included. The runner API documents parameters on these routes (`?tail=` on logs),
+    // and rebuilding the path from the route value alone drops every one of them, which a caller
+    // experiences as a parameter that is accepted and ignored.
     var result = await registry.SendAsync(runner, http.Request.Method,
-        $"{ManagementProtocol.ApiPrefix}/instances/{path}", body, Actor(http), ct);
+        $"{ManagementProtocol.ApiPrefix}/instances/{path}{http.Request.QueryString}",
+        body, Actor(http), ct);
 
     // A 409 from the runner carries the controlling Conductor and both exits. Passing it through
     // untouched is what lets the UI render the banner without special-casing every endpoint that can
@@ -187,22 +220,15 @@ app.Map("/api/v1/console/{instance}", async (string instance, HttpContext http,
     if (runner is null)
         return;
 
-    using var subscription = registry.SubscribeLogs(instance, async line =>
-    {
-        try
-        {
-            await socket.SendAsync(
-                Encoding.UTF8.GetBytes(ManagementProtocol.Serialize(line)),
-                WebSocketMessageType.Text, true, CancellationToken.None);
-        }
-        catch (WebSocketException) { }
-    });
+    // A WebSocket permits one send at a time, and this socket now has two writers: log lines arriving
+    // from the runner on the publisher's thread, and the answer to a command typed here. Without the
+    // gate they overlap the first time somebody types while the server is talking.
+    using var sendGate = new SemaphoreSlim(1, 1);
 
-    await registry.SendFrameAsync(runner, new PlaneFrame
-    {
-        Kind = PlaneFrameKind.Subscribe,
-        InstanceName = instance,
-    }, ct);
+    // Subscribing is reference counted inside the registry, so a second operator opening this console
+    // does not double the runner's stream and closing one of the two does not blind the other.
+    await using var watch = await registry.WatchLogsAsync(runner, instance,
+        line => _ = SendLineAsync(socket, sendGate, line), ct);
 
     var buffer = new byte[4096];
     while (socket.State == WebSocketState.Open && !ct.IsCancellationRequested)
@@ -221,20 +247,17 @@ app.Map("/api/v1/console/{instance}", async (string instance, HttpContext http,
         if (command.Length == 0)
             continue;
 
-        await registry.SendAsync(runner, "POST",
+        var result = await registry.SendAsync(runner, "POST",
             $"{ManagementProtocol.ApiPrefix}/instances/{instance}/exec",
             ManagementProtocol.Serialize(new { command }), Actor(http), ct);
-    }
 
-    await registry.SendFrameAsync(runner, new PlaneFrame
-    {
-        Kind = PlaneFrameKind.Unsubscribe,
-        InstanceName = instance,
-    }, CancellationToken.None);
+        if (ExecOutcome(instance, result) is { } outcome)
+            await SendLineAsync(socket, sendGate, outcome);
+    }
 });
 
 app.Run();
-return;
+return 0;
 
 // ---- helpers ----
 
@@ -253,10 +276,68 @@ async Task<IResult> ProxyAsync(HttpContext http, RunnerRegistry registry, Cancel
     }
 
     var result = await registry.SendAsync(runner, http.Request.Method,
-        ManagementProtocol.ApiPrefix + http.Request.Path.Value?["/api/v1".Length..],
+        ManagementProtocol.ApiPrefix + http.Request.Path.Value?["/api/v1".Length..]
+            + http.Request.QueryString,
         body, Actor(http), ct);
 
     return Results.Content(result.Body ?? "", "application/json", Encoding.UTF8, result.Status);
+}
+
+/// <summary>Write one line to a console socket, serialized against every other writer on it.</summary>
+static async Task SendLineAsync(WebSocket socket, SemaphoreSlim gate, LogLine line)
+{
+    try
+    {
+        await gate.WaitAsync();
+    }
+    catch (ObjectDisposedException)
+    {
+        return; // the socket is being torn down; a log line arriving now has nowhere to go
+    }
+
+    try
+    {
+        if (socket.State == WebSocketState.Open)
+            await socket.SendAsync(Encoding.UTF8.GetBytes(ManagementProtocol.Serialize(line)),
+                WebSocketMessageType.Text, true, CancellationToken.None);
+    }
+    catch (Exception ex) when (ex is WebSocketException or ObjectDisposedException) { }
+    finally
+    {
+        try { gate.Release(); } catch (ObjectDisposedException) { }
+    }
+}
+
+/// <summary>What the runner said about a command somebody typed, as a line the console can print.
+///
+/// Only failures. A command the runner accepted is already on screen twice over — the panel echoes
+/// the line, and the server's own output comes back over this same socket — so a "sent" per command
+/// would double everything an operator types. A refusal produces nothing at all without this: a
+/// semicolon the runner rejects, an instance an orchestrator holds, a runner that stopped answering.
+/// Silence in a console reads as a command that ran, which is the worst of the three.</summary>
+static LogLine? ExecOutcome(string instance, CommandResult result)
+{
+    if (result.Status is >= 200 and < 300)
+        return null;
+
+    ApiError? error = null;
+    try
+    {
+        if (result.Body is not null)
+            error = ManagementProtocol.Deserialize<ApiError>(result.Body);
+    }
+    catch (System.Text.Json.JsonException)
+    {
+        // A body that is not an ApiError still has to produce a line; the status alone says enough.
+    }
+
+    return new LogLine
+    {
+        InstanceName = instance,
+        Stream = LogStream.Runner,
+        Text = error?.Message ?? $"the runner refused that command ({result.Status})",
+        Timestamp = DateTimeOffset.UtcNow,
+    };
 }
 
 static LinkedRunner? ResolveRunner(HttpContext http, RunnerRegistry registry) =>
@@ -271,19 +352,20 @@ static string Actor(HttpContext http)
     return string.IsNullOrEmpty(session) ? $"webserver@{remote}" : $"{session}@{remote}";
 }
 
-static bool Authorized(HttpContext http, WebServerOptions options)
+/// <summary>Only the hash of the token is stored, so this hashes what was presented and compares
+/// digests. Nothing on this box can produce a live token back from what is on disk.
+///
+/// The query string is still accepted because a browser cannot set a header on a WebSocket handshake
+/// or a static page load, and the panel has both. It is the reason this endpoint stays on loopback or
+/// behind TLS: a token in a URL is a token in a proxy log.</summary>
+static bool Authorized(HttpContext http, RunnerTokenStore tokens)
 {
-    if (string.IsNullOrEmpty(options.Token))
-        return false;
-
     var header = http.Request.Headers.Authorization.ToString();
     var presented = header.StartsWith("Bearer ", StringComparison.Ordinal)
         ? header["Bearer ".Length..]
         : http.Request.Query["token"].ToString();
 
-    return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
-        Encoding.UTF8.GetBytes(presented.PadRight(64)[..64]),
-        Encoding.UTF8.GetBytes(options.Token.PadRight(64)[..64]));
+    return tokens.Verify(presented);
 }
 
 static async Task<RunnerFrame?> ReceiveAsync(WebSocket socket, CancellationToken ct)

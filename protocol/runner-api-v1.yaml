@@ -53,6 +53,21 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/RunnerStatus" }
 
+  /api/v1/agent/status:
+    get:
+      tags: [instances]
+      deprecated: true
+      summary: Deprecated alias of /api/v1/runner/status
+      description: |
+        A runner was called a host agent before it was called a runner. The alias is still routed so a
+        plane pinned to the old name keeps working; nothing new should use it.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunnerStatus" }
+
   /api/v1/instances:
     get:
       tags: [instances]
@@ -79,7 +94,13 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/InstanceSpec" }
-        "409": { $ref: "#/components/responses/Conflict" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: |
+            The name is taken. `code` is `instance_exists`, and it is a distinct answer from the 400
+            above on purpose: a panel has to tell "pick another name" apart from "that request was
+            malformed", because the first is one field to fix with everything else still on screen.
+          content: { application/json: { schema: { $ref: "#/components/schemas/ApiError" } } }
 
   /api/v1/instances/{name}:
     parameters:
@@ -126,6 +147,54 @@ paths:
         "204": { description: Deleted }
         "409": { $ref: "#/components/responses/Conflict" }
 
+  /api/v1/instances/{name}/config:
+    parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+    get:
+      tags: [instances]
+      summary: Read this instance's server.cfg
+      description: |
+        The file the game executes at startup. It belongs to the game and to the operator, not to the
+        runner, which never reads it: everything the runner needs is in the instance spec, and the
+        cvars it does care about are pinned on the command line at every start so a stale copy in this
+        file cannot contradict them.
+
+        Allowed while orchestrated. The host owner keeps every read, and this file is on their disk.
+
+        The body is the whole file as one string. Nothing here parses it, because a structured shape
+        would be the runner claiming to understand a config format that is the game's.
+      responses:
+        "200":
+          description: OK. `text` is empty for an instance that has no server.cfg yet.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServerConfig" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [instances]
+      summary: Replace this instance's server.cfg
+      description: |
+        Whole file, not a diff: it is a text box in a panel, and merging two edits of a config nobody
+        parses would guess wrong.
+
+        Written temp-and-move rather than in place. The file decides what the server comes up as and
+        there is no other copy of it, so a truncating write interrupted by a crash or a full disk
+        would leave an operator with an empty config and a server that boots wrong from it.
+
+        Takes effect at the next start; the runner does not reload a running server.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ServerConfig" }
+      responses:
+        "200":
+          description: Written
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServerConfig" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Orchestrated" }
+
   /api/v1/instances/{name}/status:
     parameters: [{ $ref: "#/components/parameters/InstanceName" }]
     get:
@@ -146,7 +215,12 @@ paths:
       - $ref: "#/components/parameters/InstanceName"
       - name: tail
         in: query
-        schema: { type: integer, default: 500 }
+        description: |
+          Lines from the end of the runner's in-memory ring. Clamped rather than refused at either
+          end: above the ring there is nothing more to return, so asking for more than the runner
+          keeps means all of it. A value that is not a number is the default, because a log read is
+          not worth failing over a typo in a query string.
+        schema: { type: integer, default: 500, minimum: 1, maximum: 2000 }
     get:
       tags: [instances]
       summary: Recent output
@@ -177,6 +251,28 @@ paths:
           content:
             application/json:
               schema: { type: array, items: { type: string } }
+
+  /api/v1/instances/{name}/content:
+    parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+    get:
+      tags: [content]
+      summary: The content set this instance is configured for
+      description: |
+        What the spec asks for, not what is on disk: a package the runner has not fetched yet is
+        still listed here. `/api/v1/content` is the other half, and the difference between the two is
+        what a sync is still owed.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  content_set:
+                    type: array
+                    items: { type: string, pattern: "^[0-9a-f]{64}$" }
+                  cache_dir: { type: string, nullable: true }
 
   /api/v1/instances/{name}/start:
     parameters: [{ $ref: "#/components/parameters/InstanceName" }]
@@ -293,8 +389,18 @@ paths:
     get:
       tags: [content]
       summary: The content packages this runner has cached
+      description: |
+        The cache is shared by every instance on the box, so two servers running the same map pool
+        hold one copy between them. Listing it never opens an archive: the file name is the hash,
+        which is the point of addressing packages by their content. A package's name, its maps and
+        where it was fetched from are not recoverable from the cache and are absent here rather than
+        guessed.
       responses:
-        "200": { description: OK }
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/ContentPackage" } }
 
 components:
   securitySchemes:
@@ -308,7 +414,11 @@ components:
       name: name
       in: path
       required: true
-      schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,64}$" }
+      description: |
+        A name becomes a directory name and a command-line argument, so it is restricted rather than
+        sanitized: silently rewriting an operator's name would make `vortex server start x` fail to
+        find the thing they just created. '.' and '..' are excluded for the obvious reason.
+      schema: { type: string, pattern: '^(?!\.\.?$)[A-Za-z0-9._-]{1,64}$' }
 
   responses:
     BadRequest:
@@ -352,6 +462,12 @@ components:
             reporting the instance running, because a process that started is not a server that bound.
         max_players: { type: integer, default: 16 }
         hostname: { type: string }
+        listed:
+          type: boolean
+          default: true
+          description: Announce this instance to the master so it appears in the server browser. The
+            runner pins sv_public accordingly at every start, so false means the server sends no
+            announce at all rather than asking the master not to list it.
         build_id: { type: string, nullable: true }
         restart_policy: { type: string, enum: [always, on_failure, never], default: on_failure }
         restart_at:
@@ -418,6 +534,15 @@ components:
             linked runner with every instance local is a normal state.
         instances: { type: array, items: { $ref: "#/components/schemas/InstanceStatus" } }
 
+    ServerConfig:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          description: The whole server.cfg. Empty means the instance has none yet, which is what a
+            newly created instance looks like until it is first started.
+
     LogLine:
       type: object
       properties:
@@ -442,6 +567,29 @@ components:
         size_bytes: { type: integer }
         installed_at: { type: string, format: date-time }
         in_use: { type: boolean }
+
+    ContentPackage:
+      type: object
+      required: [sha256, name]
+      properties:
+        sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Of the whole .pk3. Nothing inside the archive is trusted to name it.
+        name: { type: string }
+        size_bytes: { type: integer }
+        maps: { type: array, items: { type: string }, nullable: true }
+        map_format:
+          type: string
+          nullable: true
+          description: bsp or vmap. Both are accepted; the legacy format keeps working while vmap
+            becomes the norm.
+        added_at: { type: string, format: date-time, nullable: true }
+        url:
+          type: string
+          nullable: true
+          description: Where a runner, or a joining player, fetches it. Content-addressed, so it is
+            cacheable and safe to hand to a CDN.
 
     ApiError:
       type: object

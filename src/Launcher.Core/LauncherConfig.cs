@@ -1,3 +1,5 @@
+using Launcher.Protocol;
+
 namespace Launcher.Core;
 
 /// <summary>The one place the distribution endpoints live (ADR-0015 §5).</summary>
@@ -32,6 +34,11 @@ public static class LauncherConfig
     /// redirect — a plain HTTP fetch, no API call, no rate limit.</summary>
     public const string LatestManifestUrl = $"{RepoUrl}/releases/latest/download/latest.json";
 
+    /// <summary>The minisign detached signature over <see cref="LatestManifestUrl"/>, attached to
+    /// the same release under minisign's default output name. Requirements for the release job that
+    /// produces it are in release-signing.md.</summary>
+    public const string LatestManifestSignatureUrl = LatestManifestUrl + ".minisig";
+
     /// <summary>Fallback/beta: the Releases API listing (rate-limited 60/hr unauthenticated —
     /// never the default path). Also the only path that sees prereleases.</summary>
     public const string ReleasesApiUrl = $"https://api.github.com/repos/{Repo}/releases?per_page=10";
@@ -46,10 +53,10 @@ public sealed class LauncherPaths
 {
     public string Root { get; }
 
+    // The default root comes from Launcher.Protocol so that Launcher.WebServer, which cannot
+    // reference this project, still finds runner.json in the same place the runner wrote it.
     public LauncherPaths(string? rootOverride = null) =>
-        Root = rootOverride ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "VortexArena", "Launcher");
+        Root = rootOverride ?? RunnerLayout.DefaultDataRoot;
 
     public string GameDir => Path.Combine(Root, "game");
     /// <summary>One extracted install per version — current + N-1 kept for rollback.</summary>

@@ -9,7 +9,13 @@ public interface IDownloader
 {
     /// <summary>Download url → destPath, resuming a partial file if present, then verify sha256.
     /// A missing checksum is a hard error: unverified bits are never handed to the installer
-    /// (ADR-0015 invariant #2). On mismatch the file is deleted and the call throws.</summary>
+    /// (ADR-0015 invariant #2). On mismatch the file is deleted and the call throws.
+    ///
+    /// This is also the last link of the release-signature chain (see
+    /// <see cref="Signing.ReleaseSigning"/>): the signature covers the manifest, the manifest carries
+    /// this checksum, and this check ties it to the bytes on disk. The "no checksum, no install"
+    /// rule below is what keeps that chain from having a hole in it, which is why it stays a throw
+    /// and never becomes a warning.</summary>
     Task DownloadAsync(string url, string destPath, long expectedSize, string? expectedSha256,
         IProgress<double>? progress, CancellationToken ct);
 }
