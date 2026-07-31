@@ -18,8 +18,31 @@ public sealed record InstalledState(
     string Version, string Layout, string PlatformKey, string Root, string? AssetsVersion,
     string? BuildId = null, string? DirName = null)
 {
-    public const string LayoutFat = "fat";
+    /// <summary>Normalized once, here, so no consumer has to know the old spelling existed. The
+    /// primary constructor is also the JSON deserialization path, so a current.json written before
+    /// the rename comes back out reading "complete".</summary>
+    public string Layout { get; init; } = NormalizeLayout(Layout);
+
+    /// <summary>Binary + runtime + all game data in one download. Was <c>"fat"</c>, which was jargon
+    /// and reached the player: the launcher renders this value straight into the INSTALLED box.</summary>
+    public const string LayoutComplete = "complete";
+
     public const string LayoutCore = "core";
+
+    /// <summary>What <see cref="LayoutComplete"/> used to be called. Still read, never written:
+    /// every current.json on disk before this rename carries it, and a marker the launcher cannot
+    /// read is an install it reports as missing while the files sit right there. Route reads through
+    /// <see cref="NormalizeLayout"/> rather than comparing against this.</summary>
+    public const string LayoutFat = "fat";
+
+    /// <summary>Collapses the old spelling onto the new one. Anything unrecognised is returned
+    /// unchanged rather than forced to a default — the value is descriptive, a marker written by a
+    /// newer launcher may use a layout this one predates, and guessing "complete" for it would send
+    /// the game launcher looking for assets beside the binary that are not there.</summary>
+    public static string NormalizeLayout(string? layout) =>
+        string.Equals(layout, LayoutFat, StringComparison.OrdinalIgnoreCase)
+            ? LayoutComplete
+            : layout ?? LayoutComplete;
 
     // Both are derived views, not stored facts. Serializing them would put four fields in current.json
     // where two are authoritative, and the next reader would have to work out which pair to trust.
@@ -95,13 +118,13 @@ public sealed class InstallService(LauncherPaths paths, IDownloader downloader,
             ?? throw new InvalidOperationException(
                 $"release {manifest.Tag} has no {platformKey} package (its build job may have failed)");
 
-        // Core needs the assets pack in the manifest; otherwise fall back to fat.
+        // Core needs the assets pack in the manifest; otherwise fall back to the complete bundle.
         ManifestFile file;
         string layout;
         if (preferCore && plat.Core is not null && manifest.Assets is not null)
             (file, layout) = (plat.Core, InstalledState.LayoutCore);
-        else if (plat.Fat is not null)
-            (file, layout) = (plat.Fat, InstalledState.LayoutFat);
+        else if (plat.Bundle is not null)
+            (file, layout) = (plat.Bundle, InstalledState.LayoutComplete);
         else if (plat.Core is not null && manifest.Assets is not null)
             (file, layout) = (plat.Core, InstalledState.LayoutCore);
         else

@@ -71,6 +71,17 @@ Two different update problems, two mechanisms:
 
 ### 4. Split payload: `-core` zips + a content-addressed assets pack (fat zips kept)
 
+> **Renamed since.** What this section calls a **fat** zip is now called a **complete** one, because
+> the word reached the player: the launcher renders the layout straight into its INSTALLED box, and
+> `0.2.0 (fat)` is jargon at best. The change is the name only — same artifact, same split, same
+> reasoning below.
+>
+> Both spellings are live and have to stay that way for a while. `latest.json` is written by the
+> game repo and read here, so the `platforms.<key>.fat` key below is still accepted
+> (`ManifestPlatform.Bundle` resolves either), and `current.json` markers written before the rename
+> still say `"fat"` — `InstalledState.NormalizeLayout` folds them onto `complete` on read. Nothing
+> writes the old word any more. `runner-api-v1.yaml` lists all three values for the same reason.
+
 `release.yml` + `tools/package.sh` additionally emit, per release:
 
 | Artifact | Contents | Size | Changes |

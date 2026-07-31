@@ -59,8 +59,13 @@ public class ManifestTests
         // The deduped assets pack points at a PREVIOUS release's URL — must round-trip untouched.
         Assert.Contains("/v0.1.0/", m.Assets.Url);
 
+        // This fixture carries the ORIGINAL "fat" key, which is the point of leaving it that way:
+        // it is the shape every release published before the rename has, and the launcher has to go
+        // on reading it. Bundle is the accessor that spans both spellings.
         var win = m.PlatformFor(PlatformKey.Windows);
         Assert.NotNull(win?.Fat);
+        Assert.Null(win?.Complete);
+        Assert.Same(win!.Fat, win.Bundle);
         Assert.NotNull(win?.Core);
         Assert.Equal("windows-client", win!.Core!.Root);
         Assert.Equal(90000000, win.Core.Size);
@@ -68,10 +73,33 @@ public class ManifestTests
         // The best-effort macOS job failed this release: entry present, both packages null.
         var mac = m.PlatformFor(PlatformKey.MacOS);
         Assert.NotNull(mac);
-        Assert.Null(mac!.Fat);
+        Assert.Null(mac!.Bundle);
         Assert.Null(mac.Core);
 
         Assert.Null(m.PlatformFor(PlatformKey.Linux)); // omitted entirely is also legal
+    }
+
+    /// <summary>latest.json is written by the game repo and read here, so the two sides rename on
+    /// their own schedules and every combination has to resolve. Three cases, one answer each:
+    /// the old key alone (releases already published), the new key alone (once the game repo has
+    /// switched), and both at once (the transition, where make-manifest.py emits the pair).</summary>
+    [Theory]
+    [InlineData("""{"complete": {"name": "new.zip", "root": "r", "size": 1, "sha256": "aa", "url": "u"}}""", "new.zip")]
+    [InlineData("""{"fat": {"name": "old.zip", "root": "r", "size": 1, "sha256": "aa", "url": "u"}}""", "old.zip")]
+    [InlineData("""
+        {"complete": {"name": "new.zip", "root": "r", "size": 1, "sha256": "aa", "url": "u"},
+         "fat": {"name": "old.zip", "root": "r", "size": 1, "sha256": "aa", "url": "u"}}
+        """, "new.zip")]
+    public void Either_spelling_of_the_bundle_key_resolves(string platformJson, string expected)
+    {
+        // Concatenated rather than interpolated: the surrounding JSON is nothing but braces, and
+        // escaping them through a raw interpolated literal costs more than it saves.
+        var json = """{"schema": 1, "version": "0.2.0", "tag": "v0.2.0", "platforms": {"windows-x86_64": """
+                   + platformJson + "}}";
+
+        var m = ReleaseManifest.Parse(json)!;
+
+        Assert.Equal(expected, m.PlatformFor(PlatformKey.Windows)!.Bundle!.Name);
     }
 }
 
@@ -125,8 +153,8 @@ public class GitHubApiFeedTests
         Assert.Equal("0.1.0-alpha", m.Version);
         Assert.True(m.Prerelease);
         Assert.Equal("First alpha.", m.NotesBody);
-        Assert.Equal("feed02", m.PlatformFor(PlatformKey.Windows)!.Fat!.Sha256); // sums win
-        Assert.Equal("beef01", m.PlatformFor(PlatformKey.Linux)!.Fat!.Sha256);   // sums cover no-digest
+        Assert.Equal("feed02", m.PlatformFor(PlatformKey.Windows)!.Bundle!.Sha256); // sums win
+        Assert.Equal("beef01", m.PlatformFor(PlatformKey.Linux)!.Bundle!.Sha256);   // sums cover no-digest
         Assert.Equal("ccdd11", m.Assets!.Sha256);                                 // digest, lowercased
         Assert.Equal("abc123def456", m.Assets.Version);
     }
@@ -139,7 +167,7 @@ public class GitHubApiFeedTests
 
         // windows has a digest → kept; linux has neither digest nor sums entry → dropped
         // (the installer never installs unverifiable bits — ADR-0015 invariant #2).
-        Assert.NotNull(m.PlatformFor(PlatformKey.Windows)?.Fat);
+        Assert.NotNull(m.PlatformFor(PlatformKey.Windows)?.Bundle);
         Assert.Null(m.PlatformFor(PlatformKey.Linux));
     }
 }

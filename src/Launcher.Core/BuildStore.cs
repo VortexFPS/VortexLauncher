@@ -99,7 +99,7 @@ public sealed class BuildStore(LauncherPaths paths)
                 DirName = dir.Name,
                 Version = dir.Name,
                 PlatformKey = PlatformKey.Current,
-                Layout = InstalledState.LayoutFat,
+                Layout = InstalledState.LayoutComplete,
                 Root = root,
                 Provider = BuildProviders.Release,
                 InstalledAt = dir.LastWriteTimeUtc,

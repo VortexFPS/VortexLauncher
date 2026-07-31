@@ -4,12 +4,16 @@ using Launcher.Core;
 
 namespace Launcher.Desktop.ViewModels;
 
-/// <summary>The settings sheet: release channel and install location. Shown over the main window
-/// rather than in its own window so the two states the player cares about — what is installed and
-/// where it is going — stay on screen together.
+/// <summary>The settings sheet: channel, both update policies, notifications and folders, split
+/// across tabs with a search box over them. Shown over the main window rather than in its own
+/// window so the two states the player cares about — what is installed and where it is going —
+/// stay on screen together.
 ///
 /// Edits are held here and only written on Save, because saving a new install root is what triggers
-/// the relocation, and that is not something to start on a keystroke.</summary>
+/// the relocation, and that is not something to start on a keystroke. That is also why dismissing
+/// the sheet by clicking outside it routes through <see cref="CancelCommand"/>: the discard is the
+/// conventional meaning of clicking away, and going through the command means the guard that keeps
+/// a relocation from being interrupted applies to that route too.</summary>
 public partial class SettingsViewModel : ObservableObject
 {
     private readonly LauncherSettingsStore _store;
@@ -29,6 +33,95 @@ public partial class SettingsViewModel : ObservableObject
     [ObservableProperty] private string _statusText = "";
     [ObservableProperty] private bool _confirmVisible;
     [ObservableProperty] private string _confirmText = "";
+
+    // ── navigation: tabs and search ────────────────────────────────────────────────────────────
+    //
+    // The sheet outgrew one scrolling column. Five sections meant the Save button was below the
+    // fold and the section you wanted was found by scrolling past the four you did not, so the
+    // categories became tabs and the footer got pinned.
+    //
+    // Search sits over the top of the tabs rather than beside them: a player who does not know
+    // which category a setting is filed under is exactly the player who needs to find it, and
+    // making them guess the tab first is the problem restated. While a query is live the tab
+    // selection is ignored and every matching row shows, whichever tab it belongs to.
+
+    private string _activeTab = SettingsTabs.Channel;
+
+    [ObservableProperty] private string _searchText = "";
+
+    partial void OnSearchTextChanged(string value) => RefreshVisibility();
+
+    /// <summary>True while a query is filtering the sheet.</summary>
+    public bool Searching => !string.IsNullOrWhiteSpace(SearchText);
+
+    /// <summary>Nothing matched. Worth its own state: an empty sheet with a populated search box
+    /// reads as a broken screen unless something says otherwise.</summary>
+    public bool NoResults => Searching
+        && !ShowChannel && !ShowGameUpdates && !ShowLauncherUpdates
+        && !ShowNotifications && !ShowFolders;
+
+    public string ActiveTab
+    {
+        get => _activeTab;
+        set
+        {
+            if (SetProperty(ref _activeTab, value))
+                RefreshVisibility();
+        }
+    }
+
+    // The rail. One bool per tab in the same shape as the channel radio pair, so the view binds
+    // RadioButtons directly instead of going through a converter.
+    public bool ChannelTab { get => ActiveTab == SettingsTabs.Channel; set { if (value) ActiveTab = SettingsTabs.Channel; } }
+    public bool GameTab { get => ActiveTab == SettingsTabs.GameUpdates; set { if (value) ActiveTab = SettingsTabs.GameUpdates; } }
+    public bool LauncherTab { get => ActiveTab == SettingsTabs.LauncherUpdates; set { if (value) ActiveTab = SettingsTabs.LauncherUpdates; } }
+    public bool NotificationsTab { get => ActiveTab == SettingsTabs.Notifications; set { if (value) ActiveTab = SettingsTabs.Notifications; } }
+    public bool FoldersTab { get => ActiveTab == SettingsTabs.Folders; set { if (value) ActiveTab = SettingsTabs.Folders; } }
+
+    // Sections: visible when their tab is selected, or — while searching — when anything inside
+    // them matches. Rows within a visible section are all shown when not searching, and filtered to
+    // the matches when searching, so a hit on the check interval does not drag the whole
+    // notifications block along with it.
+    public bool ShowChannel => SectionVisible(SettingsTabs.Channel, SettingsSearch.Channel);
+    public bool ShowGameUpdates => SectionVisible(SettingsTabs.GameUpdates, SettingsSearch.GameUpdates);
+    public bool ShowLauncherUpdates => SectionVisible(SettingsTabs.LauncherUpdates, SettingsSearch.LauncherUpdates);
+
+    public bool ShowNotifications => SectionVisible(SettingsTabs.Notifications,
+        SettingsSearch.Reach, SettingsSearch.Autostart, SettingsSearch.Interval);
+
+    public bool ShowFolders => SectionVisible(SettingsTabs.Folders,
+        SettingsSearch.InstallRoot, SettingsSearch.GameData);
+
+    public bool ShowReachRow => RowVisible(SettingsSearch.Reach);
+    public bool ShowAutostartRow => RowVisible(SettingsSearch.Autostart);
+    public bool ShowIntervalRow => RowVisible(SettingsSearch.Interval);
+    public bool ShowInstallRootRow => RowVisible(SettingsSearch.InstallRoot);
+    public bool ShowGameDataRow => RowVisible(SettingsSearch.GameData);
+
+    private bool SectionVisible(string tab, params string[] keys) =>
+        Searching ? keys.Any(k => SettingsSearch.Matches(k, SearchText)) : ActiveTab == tab;
+
+    private bool RowVisible(string key) => !Searching || SettingsSearch.Matches(key, SearchText);
+
+    /// <summary>Every derived visibility flag in one place, so adding a section cannot half-wire
+    /// itself: the property and its name here are the only two edits.</summary>
+    private void RefreshVisibility()
+    {
+        foreach (var name in (string[])
+                 [
+                     nameof(Searching), nameof(NoResults),
+                     nameof(ChannelTab), nameof(GameTab), nameof(LauncherTab),
+                     nameof(NotificationsTab), nameof(FoldersTab),
+                     nameof(ShowChannel), nameof(ShowGameUpdates), nameof(ShowLauncherUpdates),
+                     nameof(ShowNotifications), nameof(ShowFolders),
+                     nameof(ShowReachRow), nameof(ShowAutostartRow), nameof(ShowIntervalRow),
+                     nameof(ShowInstallRootRow), nameof(ShowGameDataRow),
+                 ])
+            OnPropertyChanged(name);
+    }
+
+    [RelayCommand]
+    private void ClearSearch() => SearchText = "";
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(StableChannel))]
@@ -69,6 +162,7 @@ public partial class SettingsViewModel : ObservableObject
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(InstallRootHint))]
+    [NotifyPropertyChangedFor(nameof(ResolvedInstallRoot))]
     private string _installRootText = "";
 
     [ObservableProperty]
@@ -108,6 +202,47 @@ public partial class SettingsViewModel : ObservableObject
 
     public string DefaultRootText => LauncherSettingsStore.DefaultRoot;
 
+    /// <summary>Where the game keeps the player's own files. Read-only on purpose — see
+    /// <see cref="GameUserData"/> for why the launcher can show this and open it but not move
+    /// it.</summary>
+    public string GameDataPath => GameUserData.Path;
+
+    /// <summary>Open a folder in the desktop's file browser. Takes the path as a parameter rather
+    /// than having one command per folder, since the two rows differ only in which path they
+    /// name.
+    ///
+    /// Reports failure into <see cref="StatusText"/> instead of throwing: the footer is on screen
+    /// whichever tab is showing, and a file browser that will not start is a footnote, not
+    /// something that should take the sheet down.</summary>
+    [RelayCommand]
+    private void OpenFolder(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return;
+
+        // The install root is bound to a TextBox the player may be mid-edit in, so open what is
+        // actually on disk rather than what is typed. NormalizeRoot maps blank and the default back
+        // to null, which LauncherPaths then expands to the platform default.
+        StatusText = Reveal.Open(path) ?? "";
+    }
+
+    /// <summary>The install root as it currently stands in the box, resolved the way Save would
+    /// resolve it, so the Open button and the setting cannot point at different folders.</summary>
+    public string ResolvedInstallRoot
+    {
+        get
+        {
+            try
+            {
+                return new LauncherPaths(NormalizeRoot(InstallRootText)).Root;
+            }
+            catch (ArgumentException)
+            {
+                return LauncherSettingsStore.DefaultRoot;
+            }
+        }
+    }
+
     public string InstallRootHint
     {
         get
@@ -129,6 +264,12 @@ public partial class SettingsViewModel : ObservableObject
     {
         _installedVersion = installedVersion;
         LoadFromSaved();
+
+        // Opened fresh every time: a stale query from the last visit would show a filtered sheet
+        // that looks like most of the settings have gone missing.
+        SearchText = "";
+        ActiveTab = SettingsTabs.Channel;
+
         IsOpen = true;
     }
 

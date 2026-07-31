@@ -54,7 +54,7 @@ public static class UpdateAvailability
             return new UpdateVerdict(UpdateStatus.PrereleaseNeedsBetaChannel, manifest, detail);
 
         var plat = manifest.PlatformFor(platformKey);
-        if (plat is null || (plat.Fat is null && plat.Core is null))
+        if (plat is null || (plat.Bundle is null && plat.Core is null))
             return new UpdateVerdict(UpdateStatus.NoPackageForPlatform, manifest, detail);
 
         if (installed is null)

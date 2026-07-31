@@ -66,7 +66,7 @@ internal static class SmokeMode
         Console.WriteLine(plat is null
             ? $"platform     : no {platformKey} package on this release"
             : $"platform     : core={(plat.Core is null ? "-" : $"{plat.Core.Name} ({plat.Core.Size / (1 << 20)} MB)")} "
-              + $"fat={(plat.Fat is null ? "-" : $"{plat.Fat.Name} ({plat.Fat.Size / (1 << 20)} MB)")}");
+              + $"complete={(plat.Bundle is null ? "-" : $"{plat.Bundle.Name} ({plat.Bundle.Size / (1 << 20)} MB)")}");
         return 0;
     }
 }

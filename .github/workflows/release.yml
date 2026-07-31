@@ -187,8 +187,15 @@ jobs:
           # VortexLauncher.exe, matching <AssemblyName>. VelopackApp.Build().Run() is already the
           # first statement in Program.cs, which is what makes the packaged app handle its own
           # install/update/uninstall hooks.
+          #
+          # packId is the identity Velopack matches an installed app to its updates by, so it is
+          # frozen at VortexLauncher regardless of what the thing is called — changing it orphans
+          # every install in the field. packTitle is the display name, and is what the Start Menu
+          # shortcut takes; without it the shortcut falls back to the id and reads "VortexLauncher".
           vpk pack \
             --packId VortexLauncher \
+            --packTitle "Vortex Arena" \
+            --packAuthors "VortexFPS" \
             --packVersion "$VERSION" \
             --packDir stage/launcher \
             --mainExe VortexLauncher.exe \

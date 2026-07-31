@@ -563,7 +563,10 @@ components:
         version: { type: string }
         provider: { type: string, enum: [release, source] }
         platform_key: { type: string }
-        layout: { type: string, enum: [fat, core], nullable: true }
+        # "fat" is the old name for "complete" and is still listed because a build store written
+        # before the rename can hand one back. The launcher normalizes it on read; a client reading
+        # this API should treat the two as the same value.
+        layout: { type: string, enum: [complete, core, fat], nullable: true }
         size_bytes: { type: integer }
         installed_at: { type: string, format: date-time }
         in_use: { type: boolean }

@@ -7,9 +7,19 @@ namespace Launcher.Core;
 /// top-level directory (tools/package.sh zips dist/&lt;target&gt;/, e.g. "windows-client").</summary>
 public sealed record ManifestFile(string Name, string? Root, long Size, string Sha256, string Url);
 
-/// <summary>A platform's packages: <see cref="Fat"/> = binary + runtime + all game data;
-/// <see cref="Core"/> = binary + runtime only (pairs with the shared assets pack).</summary>
-public sealed record ManifestPlatform(ManifestFile? Fat, ManifestFile? Core);
+/// <summary>A platform's packages: <see cref="Complete"/> = binary + runtime + all game data;
+/// <see cref="Core"/> = binary + runtime only (pairs with the shared assets pack).
+///
+/// <see cref="Fat"/> is the same thing under its old name. latest.json is a cross-repo contract, so
+/// the two keys have to coexist for as long as it takes the game repo's release job to switch and a
+/// player to be looking at a release cut before it did. Nothing should read either field directly —
+/// <see cref="Bundle"/> is the accessor, and it prefers the new key so a manifest emitting both
+/// during the transition resolves to one answer.</summary>
+public sealed record ManifestPlatform(ManifestFile? Complete, ManifestFile? Core, ManifestFile? Fat = null)
+{
+    /// <summary>The everything-in-one-zip package under whichever key this manifest used.</summary>
+    [JsonIgnore] public ManifestFile? Bundle => Complete ?? Fat;
+}
 
 /// <summary>The content-addressed game-data pack. <see cref="Version"/> is the 12-char
 /// download-assets.sh content hash (ADR-0015 §4) — the asset-store directory name.</summary>

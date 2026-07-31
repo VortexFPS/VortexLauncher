@@ -101,13 +101,14 @@
                    TextWrapping="Wrap" Margin="0,0,12,0"/>
 
         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10" HorizontalAlignment="Right">
-          <Button Content="Check again" Command="{Binding RefreshCommand}" Padding="16,8"/>
           <Button Content="Cancel" Command="{Binding CancelCommand}" Padding="16,8"
                   IsVisible="{Binding Busy}"/>
-          <Button Content="Switch now" Command="{Binding ApplyStagedCommand}" Padding="16,8"
-                  IsVisible="{Binding StagedReady}" Background="#2a72b5" Foreground="White"/>
-          <Button Content="Update" Command="{Binding UpdateCommand}" Padding="16,8"
-                  IsVisible="{Binding !StagedReady}" Background="#2a72b5" Foreground="White"/>
+          <!-- One button for check / download / swap, because only ever one of the three is the
+               right thing to press and the view model already knows which. Its label comes from
+               PrimaryActionText and its action from PrimaryActionCommand, both resolved from the
+               same state in the same order, so they cannot drift apart. -->
+          <Button Content="{Binding PrimaryActionText}" Command="{Binding PrimaryActionCommand}"
+                  Padding="16,8" Background="#2a72b5" Foreground="White"/>
           <Button Content="PLAY" Command="{Binding PlayCommand}" Padding="28,8"
                   FontWeight="Bold" Background="#2f9e44" Foreground="White"/>
         </StackPanel>
@@ -115,8 +116,13 @@
     </Grid>
 
     <!-- Settings as a sheet over this window rather than a second one: choosing where the game
-         installs reads better with what is installed still on screen behind it. -->
-    <Border Background="#f00d1017" IsVisible="{Binding Settings.IsOpen}">
+         installs reads better with what is installed still on screen behind it.
+
+         The backdrop dismisses the sheet. The handler is in the code-behind rather than a command
+         binding because it has to inspect the pointer event to tell a click on the backdrop from
+         one that bubbled up out of the sheet — see MainWindow.axaml.cs. -->
+    <Border Name="SettingsBackdrop" Background="#f00d1017" IsVisible="{Binding Settings.IsOpen}"
+            PointerPressed="OnSettingsBackdropPressed">
       <views:SettingsView DataContext="{Binding Settings}"/>
     </Border>
 

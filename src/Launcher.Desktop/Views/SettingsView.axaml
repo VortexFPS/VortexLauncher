@@ -4,121 +4,204 @@
              x:Class="Launcher.Desktop.Views.SettingsView"
              x:DataType="vm:SettingsViewModel">
 
+  <!-- Three rows: search, content, footer. The footer is outside the ScrollViewer so Cancel and
+       Save are on screen whatever the content is doing — previously they were the last thing in a
+       single long column, which put the button that commits a multi-gigabyte install move below the
+       fold on a short window.
+
+       Sections live in one flat StackPanel and show or hide themselves rather than sitting in a
+       TabControl, because search cuts across tabs: a query has to be able to put the check interval
+       and the install folder on screen together, and no tab contains both. -->
   <Border Background="#161b26" BorderBrush="#263043" BorderThickness="1" CornerRadius="10"
-          Padding="20" Margin="24" MaxWidth="700" HorizontalAlignment="Center">
-    <ScrollViewer>
-      <StackPanel Spacing="18">
+          Padding="16" Margin="24" MaxWidth="700" HorizontalAlignment="Center">
+    <Grid RowDefinitions="Auto,*,Auto">
 
-        <TextBlock Text="SETTINGS" FontSize="11" Foreground="#5a6478" FontWeight="Bold"/>
+      <!-- ── search ─────────────────────────────────────────────────────────────────────────── -->
+      <Grid Grid.Row="0" ColumnDefinitions="Auto,*,Auto" Margin="0,0,0,12">
+        <TextBlock Grid.Column="0" Text="SETTINGS" FontSize="11" Foreground="#5a6478"
+                   FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,16,0"/>
+        <TextBox Grid.Column="1" Text="{Binding SearchText}" FontSize="12"
+                 Watermark="Search settings — try &quot;folder&quot; or &quot;how often&quot;"/>
+        <Button Grid.Column="2" Content="✕" Command="{Binding ClearSearchCommand}"
+                IsVisible="{Binding Searching}" Padding="10,4" Margin="6,0,0,0"
+                Background="Transparent" Foreground="#8892a6"
+                ToolTip.Tip="Clear the search"/>
+      </Grid>
 
-        <!-- channel -->
-        <StackPanel Spacing="6">
-          <TextBlock Text="Update channel" Foreground="#e8ecf4" FontSize="14" FontWeight="SemiBold"/>
-          <RadioButton GroupName="channel" IsChecked="{Binding StableChannel}"
-                       Content="Stable — finished releases only" Foreground="#aeb7c6"/>
-          <RadioButton GroupName="channel" IsChecked="{Binding BetaChannel}"
-                       Content="Beta — includes pre-releases" Foreground="#aeb7c6"/>
-          <TextBlock Text="Beta installs pre-release builds as soon as they are published. They are newer, less tested, and can be broken; stable never installs one. You can switch back at any time."
-                     TextWrapping="Wrap" Foreground="#8892a6" FontSize="12" Margin="24,2,0,0"/>
+      <!-- ── tabs + content ─────────────────────────────────────────────────────────────────── -->
+      <Grid Grid.Row="1" ColumnDefinitions="Auto,*">
+
+        <!-- The rail. Disabled rather than hidden while searching: hiding it would reflow the sheet
+             on every keystroke, and greying it says "these are not what is filtering right now"
+             without the content jumping sideways. -->
+        <StackPanel Grid.Column="0" Spacing="2" Width="132" Margin="0,0,16,0"
+                    IsEnabled="{Binding !Searching}">
+          <RadioButton GroupName="settingsTab" IsChecked="{Binding ChannelTab}"
+                       Content="Channel" Foreground="#aeb7c6" FontSize="13"/>
+          <RadioButton GroupName="settingsTab" IsChecked="{Binding GameTab}"
+                       Content="Game updates" Foreground="#aeb7c6" FontSize="13"/>
+          <RadioButton GroupName="settingsTab" IsChecked="{Binding LauncherTab}"
+                       Content="Launcher" Foreground="#aeb7c6" FontSize="13"/>
+          <RadioButton GroupName="settingsTab" IsChecked="{Binding NotificationsTab}"
+                       Content="Notifications" Foreground="#aeb7c6" FontSize="13"/>
+          <RadioButton GroupName="settingsTab" IsChecked="{Binding FoldersTab}"
+                       Content="Folders" Foreground="#aeb7c6" FontSize="13"/>
         </StackPanel>
 
-        <!-- game updates -->
-        <StackPanel Spacing="6">
-          <TextBlock Text="Game updates" Foreground="#e8ecf4" FontSize="14" FontWeight="SemiBold"/>
-          <RadioButton GroupName="gameUpdates" IsChecked="{Binding GameDownloadThenAsk}"
-                       Content="Download in the background, ask before switching (recommended)"
-                       Foreground="#aeb7c6"/>
-          <RadioButton GroupName="gameUpdates" IsChecked="{Binding GameFullyAutomatic}"
-                       Content="Download and install automatically" Foreground="#aeb7c6"/>
-          <RadioButton GroupName="gameUpdates" IsChecked="{Binding GameNotifyOnly}"
-                       Content="Just tell me — download nothing until I press Update"
-                       Foreground="#aeb7c6"/>
-          <TextBlock Text="Downloading ahead of time is what keeps Play instant; asking before the switch is what keeps a new build from landing in the middle of a session. Neither ever replaces the build a running game is using."
-                     TextWrapping="Wrap" Foreground="#8892a6" FontSize="12" Margin="24,2,0,0"/>
-        </StackPanel>
+        <ScrollViewer Grid.Column="1" HorizontalScrollBarVisibility="Disabled">
+          <StackPanel Spacing="12">
 
-        <!-- launcher updates -->
-        <StackPanel Spacing="6">
-          <TextBlock Text="Launcher updates" Foreground="#e8ecf4" FontSize="14" FontWeight="SemiBold"/>
-          <RadioButton GroupName="launcherUpdates" IsChecked="{Binding LauncherAutomatic}"
-                       Content="Keep the launcher up to date automatically (recommended)"
-                       Foreground="#aeb7c6"/>
-          <RadioButton GroupName="launcherUpdates" IsChecked="{Binding LauncherNotifyOnly}"
-                       Content="Tell me, and let me apply it" Foreground="#aeb7c6"/>
-          <RadioButton GroupName="launcherUpdates" IsChecked="{Binding LauncherUpdatesOff}"
-                       Content="Don't update the launcher" Foreground="#aeb7c6"/>
-          <TextBlock IsVisible="{Binding LauncherUpdatesOff}"
-                     Text="The launcher reads the game's release list through a file format that both sides have to agree on. A launcher left far enough behind can stop being able to read it — at which point it can't install or update the game either. It will still tell you when a newer launcher exists."
-                     TextWrapping="Wrap" Foreground="#ffd43b" FontSize="12" Margin="24,2,0,0"/>
-          <TextBlock IsVisible="{Binding !LauncherUpdatesOff}"
-                     Text="The launcher restarts to finish updating itself, and never does that while a download or the game is running."
-                     TextWrapping="Wrap" Foreground="#8892a6" FontSize="12" Margin="24,2,0,0"/>
-        </StackPanel>
+            <TextBlock IsVisible="{Binding NoResults}" TextWrapping="Wrap" Foreground="#8892a6"
+                       FontSize="12" Text="No setting matches that. Clear the search to browse by category."/>
 
-        <!-- notifications -->
-        <StackPanel Spacing="6">
-          <TextBlock Text="Update notifications" Foreground="#e8ecf4" FontSize="14" FontWeight="SemiBold"/>
-          <RadioButton GroupName="reach" IsChecked="{Binding InAppReach}"
-                       Content="Only inside the launcher" Foreground="#aeb7c6"/>
-          <RadioButton GroupName="reach" IsChecked="{Binding SystemReach}"
-                       Content="Desktop notifications while the launcher is open" Foreground="#aeb7c6"/>
-          <RadioButton GroupName="reach" IsChecked="{Binding BackgroundReach}"
-                       Content="Keep checking in the background (stays in the tray when closed)"
-                       Foreground="#aeb7c6"/>
-          <CheckBox IsChecked="{Binding StartWithSystem}" IsEnabled="{Binding StartWithSystemEnabled}"
-                    Content="Start the launcher when I log in" Foreground="#aeb7c6"
-                    Margin="24,0,0,0"/>
-          <Grid ColumnDefinitions="Auto,8,80,8,*" Margin="24,4,0,0">
-            <TextBlock Grid.Column="0" Text="Check every" Foreground="#aeb7c6" FontSize="12"
-                       VerticalAlignment="Center"/>
-            <TextBox Grid.Column="2" Text="{Binding CheckIntervalText}" FontSize="12"/>
-            <TextBlock Grid.Column="4" Text="minutes (0 = only when the launcher starts; minimum 15)"
-                       Foreground="#8892a6" FontSize="12" VerticalAlignment="Center"
-                       TextWrapping="Wrap"/>
-          </Grid>
-        </StackPanel>
-
-        <!-- install location -->
-        <StackPanel Spacing="6">
-          <TextBlock Text="Install location" Foreground="#e8ecf4" FontSize="14" FontWeight="SemiBold"/>
-          <Grid ColumnDefinitions="*,8,Auto,8,Auto">
-            <TextBox Grid.Column="0" Text="{Binding InstallRootText}" FontSize="12"
-                     Watermark="{Binding DefaultRootText}"/>
-            <Button Grid.Column="2" Content="Browse…" Command="{Binding BrowseCommand}" Padding="14,6"/>
-            <Button Grid.Column="4" Content="Default" Command="{Binding UseDefaultLocationCommand}"
-                    Padding="14,6"/>
-          </Grid>
-          <TextBlock Text="{Binding InstallRootHint}" TextWrapping="Wrap"
-                     Foreground="#8892a6" FontSize="12"/>
-        </StackPanel>
-
-        <!-- relocation confirmation -->
-        <Border IsVisible="{Binding ConfirmVisible}" Background="#1d2433" BorderBrush="#3d4c66"
-                BorderThickness="1" CornerRadius="8" Padding="14">
-          <StackPanel Spacing="10">
-            <TextBlock Text="Move the existing install?" Foreground="#ffd43b"
-                       FontSize="13" FontWeight="SemiBold"/>
-            <TextBlock Text="{Binding ConfirmText}" TextWrapping="Wrap"
-                       Foreground="#aeb7c6" FontSize="12"/>
-            <StackPanel Orientation="Horizontal" Spacing="10" HorizontalAlignment="Right">
-              <Button Content="Keep it where it is" Command="{Binding KeepCurrentLocationCommand}"
-                      Padding="14,6"/>
-              <Button Content="Move and save" Command="{Binding ConfirmMoveCommand}" Padding="14,6"
-                      Background="#2a72b5" Foreground="White"/>
+            <!-- ── channel ──────────────────────────────────────────────────────────────────── -->
+            <StackPanel Spacing="4" IsVisible="{Binding ShowChannel}">
+              <TextBlock Text="Update channel" Foreground="#e8ecf4" FontSize="13" FontWeight="SemiBold"/>
+              <RadioButton GroupName="channel" IsChecked="{Binding StableChannel}"
+                           Content="Stable — finished releases only" Foreground="#aeb7c6" FontSize="13"/>
+              <RadioButton GroupName="channel" IsChecked="{Binding BetaChannel}"
+                           Content="Beta — includes pre-releases" Foreground="#aeb7c6" FontSize="13"/>
+              <TextBlock Text="Beta installs pre-release builds as soon as they are published. They are newer, less tested, and can be broken; stable never installs one. You can switch back at any time."
+                         TextWrapping="Wrap" Foreground="#8892a6" FontSize="11" Margin="24,2,0,0"/>
             </StackPanel>
+
+            <!-- ── game updates ─────────────────────────────────────────────────────────────── -->
+            <StackPanel Spacing="4" IsVisible="{Binding ShowGameUpdates}">
+              <TextBlock Text="Game updates" Foreground="#e8ecf4" FontSize="13" FontWeight="SemiBold"/>
+              <RadioButton GroupName="gameUpdates" IsChecked="{Binding GameDownloadThenAsk}"
+                           Content="Download in the background, ask before switching (recommended)"
+                           Foreground="#aeb7c6" FontSize="13"/>
+              <RadioButton GroupName="gameUpdates" IsChecked="{Binding GameFullyAutomatic}"
+                           Content="Download and install automatically" Foreground="#aeb7c6" FontSize="13"/>
+              <RadioButton GroupName="gameUpdates" IsChecked="{Binding GameNotifyOnly}"
+                           Content="Just tell me — download nothing until I press Update"
+                           Foreground="#aeb7c6" FontSize="13"/>
+              <TextBlock Text="Downloading ahead of time is what keeps Play instant; asking before the switch is what keeps a new build from landing in the middle of a session. Neither ever replaces the build a running game is using."
+                         TextWrapping="Wrap" Foreground="#8892a6" FontSize="11" Margin="24,2,0,0"/>
+            </StackPanel>
+
+            <!-- ── launcher updates ─────────────────────────────────────────────────────────── -->
+            <StackPanel Spacing="4" IsVisible="{Binding ShowLauncherUpdates}">
+              <TextBlock Text="Launcher updates" Foreground="#e8ecf4" FontSize="13" FontWeight="SemiBold"/>
+              <RadioButton GroupName="launcherUpdates" IsChecked="{Binding LauncherAutomatic}"
+                           Content="Keep the launcher up to date automatically (recommended)"
+                           Foreground="#aeb7c6" FontSize="13"/>
+              <RadioButton GroupName="launcherUpdates" IsChecked="{Binding LauncherNotifyOnly}"
+                           Content="Tell me, and let me apply it" Foreground="#aeb7c6" FontSize="13"/>
+              <RadioButton GroupName="launcherUpdates" IsChecked="{Binding LauncherUpdatesOff}"
+                           Content="Don't update the launcher" Foreground="#aeb7c6" FontSize="13"/>
+              <TextBlock IsVisible="{Binding LauncherUpdatesOff}"
+                         Text="The launcher reads the game's release list through a file format that both sides have to agree on. A launcher left far enough behind can stop being able to read it — at which point it can't install or update the game either. It will still tell you when a newer launcher exists."
+                         TextWrapping="Wrap" Foreground="#ffd43b" FontSize="11" Margin="24,2,0,0"/>
+              <TextBlock IsVisible="{Binding !LauncherUpdatesOff}"
+                         Text="Finishing a launcher update needs a restart. It never restarts while a download or the game is running."
+                         TextWrapping="Wrap" Foreground="#8892a6" FontSize="11" Margin="24,2,0,0"/>
+            </StackPanel>
+
+            <!-- ── notifications ────────────────────────────────────────────────────────────── -->
+            <StackPanel Spacing="4" IsVisible="{Binding ShowNotifications}">
+              <TextBlock Text="Update notifications" Foreground="#e8ecf4" FontSize="13" FontWeight="SemiBold"/>
+
+              <StackPanel Spacing="4" IsVisible="{Binding ShowReachRow}">
+                <RadioButton GroupName="reach" IsChecked="{Binding InAppReach}"
+                             Content="Only inside the launcher" Foreground="#aeb7c6" FontSize="13"/>
+                <RadioButton GroupName="reach" IsChecked="{Binding SystemReach}"
+                             Content="Desktop notifications while the launcher is open"
+                             Foreground="#aeb7c6" FontSize="13"/>
+                <RadioButton GroupName="reach" IsChecked="{Binding BackgroundReach}"
+                             Content="Keep checking in the background (stays in the tray when closed)"
+                             Foreground="#aeb7c6" FontSize="13"/>
+              </StackPanel>
+
+              <CheckBox IsChecked="{Binding StartWithSystem}" IsEnabled="{Binding StartWithSystemEnabled}"
+                        IsVisible="{Binding ShowAutostartRow}"
+                        Content="Start the launcher when I log in" Foreground="#aeb7c6" FontSize="13"
+                        Margin="24,0,0,0"/>
+
+              <Grid ColumnDefinitions="Auto,8,72,8,*" Margin="24,4,0,0"
+                    IsVisible="{Binding ShowIntervalRow}">
+                <TextBlock Grid.Column="0" Text="Check every" Foreground="#aeb7c6" FontSize="11"
+                           VerticalAlignment="Center"/>
+                <TextBox Grid.Column="2" Text="{Binding CheckIntervalText}" FontSize="11"/>
+                <TextBlock Grid.Column="4" Text="minutes (0 = only when the launcher starts; minimum 15)"
+                           Foreground="#8892a6" FontSize="11" VerticalAlignment="Center"
+                           TextWrapping="Wrap"/>
+              </Grid>
+            </StackPanel>
+
+            <!-- ── folders ──────────────────────────────────────────────────────────────────── -->
+            <StackPanel Spacing="10" IsVisible="{Binding ShowFolders}">
+
+              <StackPanel Spacing="4" IsVisible="{Binding ShowInstallRootRow}">
+                <TextBlock Text="Install location" Foreground="#e8ecf4" FontSize="13" FontWeight="SemiBold"/>
+                <Grid ColumnDefinitions="*,6,Auto,6,Auto,6,Auto">
+                  <TextBox Grid.Column="0" Text="{Binding InstallRootText}" FontSize="11"
+                           Watermark="{Binding DefaultRootText}"/>
+                  <Button Grid.Column="2" Content="Browse…" Command="{Binding BrowseCommand}" Padding="10,5"/>
+                  <Button Grid.Column="4" Content="Open" Padding="10,5"
+                          Command="{Binding OpenFolderCommand}"
+                          CommandParameter="{Binding ResolvedInstallRoot}"
+                          ToolTip.Tip="Show this folder in your file browser"/>
+                  <Button Grid.Column="6" Content="Default" Command="{Binding UseDefaultLocationCommand}"
+                          Padding="10,5"/>
+                </Grid>
+                <TextBlock Text="{Binding InstallRootHint}" TextWrapping="Wrap"
+                           Foreground="#8892a6" FontSize="11"/>
+              </StackPanel>
+
+              <!-- Read-only, and the text below says why rather than leaving a disabled box
+                   unexplained. Godot resolves user:// itself, and its userdir flag takes a
+                   directory name rather than a path, so a picker here would be a setting the game
+                   could not honour. See GameUserData in Launcher.Core. -->
+              <StackPanel Spacing="4" IsVisible="{Binding ShowGameDataRow}">
+                <TextBlock Text="Game data" Foreground="#e8ecf4" FontSize="13" FontWeight="SemiBold"/>
+                <Grid ColumnDefinitions="*,6,Auto">
+                  <TextBox Grid.Column="0" Text="{Binding GameDataPath}" FontSize="11"
+                           IsReadOnly="True" Foreground="#8892a6"/>
+                  <Button Grid.Column="2" Content="Open" Padding="10,5"
+                          Command="{Binding OpenFolderCommand}"
+                          CommandParameter="{Binding GameDataPath}"
+                          ToolTip.Tip="Show this folder in your file browser"/>
+                </Grid>
+                <TextBlock Text="Your settings, saves and screenshots. The game picks this folder itself and the launcher can't move it — but this is where to look, and Open will take you there."
+                           TextWrapping="Wrap" Foreground="#8892a6" FontSize="11"/>
+              </StackPanel>
+            </StackPanel>
+
+            <!-- ── relocation confirmation ──────────────────────────────────────────────────── -->
+            <Border IsVisible="{Binding ConfirmVisible}" Background="#1d2433" BorderBrush="#3d4c66"
+                    BorderThickness="1" CornerRadius="8" Padding="12">
+              <StackPanel Spacing="8">
+                <TextBlock Text="Move the existing install?" Foreground="#ffd43b"
+                           FontSize="13" FontWeight="SemiBold"/>
+                <TextBlock Text="{Binding ConfirmText}" TextWrapping="Wrap"
+                           Foreground="#aeb7c6" FontSize="11"/>
+                <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                  <Button Content="Keep it where it is" Command="{Binding KeepCurrentLocationCommand}"
+                          Padding="12,5"/>
+                  <Button Content="Move and save" Command="{Binding ConfirmMoveCommand}" Padding="12,5"
+                          Background="#2a72b5" Foreground="White"/>
+                </StackPanel>
+              </StackPanel>
+            </Border>
+
           </StackPanel>
-        </Border>
+        </ScrollViewer>
+      </Grid>
 
-        <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" Foreground="#8892a6" FontSize="12"
+      <!-- ── footer ─────────────────────────────────────────────────────────────────────────── -->
+      <Grid Grid.Row="2" ColumnDefinitions="*,Auto" Margin="0,12,0,0">
+        <TextBlock Grid.Column="0" Text="{Binding StatusText}" TextWrapping="Wrap"
+                   Foreground="#8892a6" FontSize="11" VerticalAlignment="Center"
+                   Margin="0,0,12,0"
                    IsVisible="{Binding StatusText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
-
-        <StackPanel Orientation="Horizontal" Spacing="10" HorizontalAlignment="Right">
-          <Button Content="Cancel" Command="{Binding CancelCommand}" Padding="16,8"/>
-          <Button Content="Save" Command="{Binding SaveCommand}" Padding="22,8"
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+          <Button Content="Cancel" Command="{Binding CancelCommand}" Padding="14,6"/>
+          <Button Content="Save" Command="{Binding SaveCommand}" Padding="20,6"
                   Background="#2a72b5" Foreground="White"/>
         </StackPanel>
+      </Grid>
 
-      </StackPanel>
-    </ScrollViewer>
+    </Grid>
   </Border>
 </UserControl>

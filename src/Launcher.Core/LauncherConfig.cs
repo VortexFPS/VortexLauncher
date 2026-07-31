@@ -96,3 +96,48 @@ public sealed class LauncherPaths
         Directory.CreateDirectory(AssetStoreDir);
     }
 }
+
+/// <summary>Where the GAME keeps the player's own files — settings, saves, screenshots, logs. Not
+/// launcher-owned, which is the whole reason this is a computed path and not a setting.
+///
+/// Godot resolves <c>user://</c> to <c>&lt;platform data dir&gt;/godot/app_userdata/&lt;project
+/// name&gt;</c>, and VortexArena's project.godot sets <c>config/name="VortexArena"</c> with no
+/// <c>use_custom_user_dir</c>, so the path is derivable without asking the game. The launcher can
+/// therefore open it, which is the useful part.
+///
+/// <b>It cannot move it.</b> Godot's <c>--userdir</c> takes a directory NAME, not a path, and the
+/// game's own Main.cs does not parse a user-directory argument at all — it handles <c>--data</c>,
+/// <c>--map</c>, <c>--dedicated</c>, <c>--port</c> and friends. Relocating this would mean rerouting
+/// every <c>user://</c> access inside the game. So the settings sheet shows the path and opens it,
+/// and does not offer a picker that could not be honoured.
+///
+/// The platform branches are written out rather than going through SpecialFolder because the
+/// mapping is wrong for this purpose on two of the three: .NET maps
+/// <c>SpecialFolder.ApplicationData</c> to <c>~/.config</c> on Linux and macOS, while Godot uses
+/// the XDG *data* dir and <c>~/Library/Application Support</c> respectively.</summary>
+public static class GameUserData
+{
+    /// <summary>project.godot's <c>config/name</c>. A rename there moves every player's saves, so
+    /// it is a game-side decision this only mirrors.</summary>
+    public const string ProjectName = "VortexArena";
+
+    public static string Path
+    {
+        get
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+            // The engine directory is "Godot" on Windows and macOS and lowercase "godot" on Linux,
+            // which only matters on the one of the three with a case-sensitive filesystem.
+            var (baseDir, godot) = OperatingSystem.IsWindows()
+                ? (Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Godot")
+                : OperatingSystem.IsMacOS()
+                    ? (System.IO.Path.Combine(home, "Library", "Application Support"), "Godot")
+                    : (Environment.GetEnvironmentVariable("XDG_DATA_HOME") is { Length: > 0 } xdg
+                        ? xdg
+                        : System.IO.Path.Combine(home, ".local", "share"), "godot");
+
+            return System.IO.Path.Combine(baseDir, godot, "app_userdata", ProjectName);
+        }
+    }
+}

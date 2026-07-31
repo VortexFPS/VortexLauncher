@@ -24,5 +24,10 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Launcher.Core\Launcher.Core.csproj" />
     <ProjectReference Include="..\..\src\Launcher.WebServer\Launcher.WebServer.csproj" />
+    <!-- For the view models only. They are plain observable objects — no control is constructed and
+         no Avalonia application is started, so these run headless like everything else here. The
+         settings sheet's search and tab filtering is real logic with real states to get wrong, and
+         it is the one part of the UI that cannot be checked by reading the XAML. -->
+    <ProjectReference Include="..\..\src\Launcher.Desktop\Launcher.Desktop.csproj" />
   </ItemGroup>
 </Project>

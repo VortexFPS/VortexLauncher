@@ -617,8 +617,8 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
             Version = sha[..7],
             PlatformKey = platformKey,
             // package.sh lays the content in beside the binary, so a source build is always the
-            // single-directory "fat" layout, never the shared-asset-store one.
-            Layout = InstalledState.LayoutFat,
+            // single-directory "complete" layout, never the shared-asset-store one.
+            Layout = InstalledState.LayoutComplete,
             Root = preset,
             Provider = BuildProviders.Source,
             InstalledAt = DateTimeOffset.UtcNow,

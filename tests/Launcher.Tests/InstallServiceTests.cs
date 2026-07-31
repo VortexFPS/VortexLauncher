@@ -26,7 +26,7 @@ public sealed class InstallServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task Fat_install_extracts_swaps_and_records_current()
+    public async Task Complete_install_extracts_swaps_and_records_current()
     {
         var m = MakeManifest("0.2.0", MakeFatZip("0.2.0"));
 
@@ -34,7 +34,7 @@ public sealed class InstallServiceTests : IDisposable
             preferCore: false, progress: null, CancellationToken.None);
 
         Assert.Equal("0.2.0", state.Version);
-        Assert.Equal(InstalledState.LayoutFat, state.Layout);
+        Assert.Equal(InstalledState.LayoutComplete, state.Layout);
         Assert.True(File.Exists(Path.Combine(_installs.GameDirOf(state), "XonoticGodot.exe")));
         Assert.Null(_installs.AssetsDataDirOf(state));
 
@@ -145,7 +145,7 @@ public sealed class InstallServiceTests : IDisposable
             DirName = BuildRecord.SafeDirName(id),
             Version = "a1b2c3d",
             PlatformKey = PlatformKey.Windows,
-            Layout = InstalledState.LayoutFat,
+            Layout = InstalledState.LayoutComplete,
             Root = "windows-client",
             Provider = BuildProviders.Source,
             InstalledAt = DateTimeOffset.UtcNow,
@@ -179,6 +179,25 @@ public sealed class InstallServiceTests : IDisposable
         Assert.NotNull(state);
         Assert.Equal("0.4.0", state!.Id);
         Assert.Equal("0.4.0", state.Dir);
+
+        // Same file, second thing it predates: "fat" was renamed to "complete" and every marker on
+        // disk still says the old word. It has to come back normalized, or the launcher shows the
+        // player a layout name that no longer exists and `vortex update` compares against a
+        // constant it can never match — which would silently move them onto the core layout.
+        Assert.Equal(InstalledState.LayoutComplete, state.Layout);
+    }
+
+    /// <summary>The other direction: nothing writes "fat" any more.</summary>
+    [Fact]
+    public async Task A_new_install_records_the_new_layout_name()
+    {
+        var m = MakeManifest("0.5.0", MakeFatZip("0.5.0"));
+
+        await _installs.InstallAsync(m, PlatformKey.Windows,
+            preferCore: false, progress: null, CancellationToken.None);
+
+        Assert.Contains("\"complete\"", File.ReadAllText(_paths.CurrentJsonPath));
+        Assert.DoesNotContain("\"fat\"", File.ReadAllText(_paths.CurrentJsonPath));
     }
 
     // ── fixtures ──────────────────────────────────────────────────────────────

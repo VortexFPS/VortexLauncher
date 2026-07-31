@@ -123,7 +123,9 @@ public sealed partial class GitHubApiFeed(HttpClient http, ManifestSignaturePoli
     public static ReleaseManifest Synthesize(ApiRelease release, IReadOnlyDictionary<string, string> sums)
     {
         var version = release.TagName.TrimStart('v');
-        var fat = new Dictionary<string, ManifestFile>();
+        // Synthesized from asset filenames, which carry no key name at all — a zip is "core" if it
+        // ends -core.zip and complete otherwise — so this side of the rename is naming only.
+        var complete = new Dictionary<string, ManifestFile>();
         var core = new Dictionary<string, ManifestFile>();
         ManifestAssets? assetsPack = null;
 
@@ -142,12 +144,12 @@ public sealed partial class GitHubApiFeed(HttpClient http, ManifestSignaturePoli
                 continue;
             }
             if (PlatformKey.TryParseZipName(a.Name, version, out var key, out var root, out var isCore))
-                (isCore ? core : fat)[key] = new ManifestFile(a.Name, root, a.Size, sha, a.BrowserDownloadUrl);
+                (isCore ? core : complete)[key] = new ManifestFile(a.Name, root, a.Size, sha, a.BrowserDownloadUrl);
         }
 
-        var platforms = fat.Keys.Union(core.Keys).ToDictionary(
+        var platforms = complete.Keys.Union(core.Keys).ToDictionary(
             k => k,
-            k => new ManifestPlatform(fat.GetValueOrDefault(k), core.GetValueOrDefault(k)));
+            k => new ManifestPlatform(complete.GetValueOrDefault(k), core.GetValueOrDefault(k)));
 
         return new ReleaseManifest
         {

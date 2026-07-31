@@ -69,6 +69,7 @@ public partial class MainWindowViewModel : ObservableObject
     [NotifyCanExecuteChangedFor(nameof(PlayCommand))]
     [NotifyCanExecuteChangedFor(nameof(UpdateCommand))]
     [NotifyCanExecuteChangedFor(nameof(RefreshCommand))]
+    [NotifyCanExecuteChangedFor(nameof(PrimaryActionCommand))]
     [NotifyCanExecuteChangedFor(nameof(CancelCommand))]
     [NotifyCanExecuteChangedFor(nameof(OpenSettingsCommand))]
     [NotifyCanExecuteChangedFor(nameof(ApplyStagedCommand))]
@@ -82,15 +83,32 @@ public partial class MainWindowViewModel : ObservableObject
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(UpdateCommand))]
+    [NotifyPropertyChangedFor(nameof(PrimaryActionText))]
     private bool _updateAvailable;
 
     /// <summary>Set once a build is downloaded and waiting for the player to switch to it.</summary>
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(ApplyStagedCommand))]
     [NotifyPropertyChangedFor(nameof(StagedText))]
+    [NotifyPropertyChangedFor(nameof(PrimaryActionText))]
     private bool _stagedReady;
 
     public string StagedText => _staged is null ? "" : $"Version {_staged.Version} is downloaded and ready.";
+
+    /// <summary>The label on the one button that is not Play. Checking and updating used to be two
+    /// buttons plus a third for the swap, which put up to three verbs beside Play and made the
+    /// player pick between them — when only ever one of the three is the right thing to press.
+    /// The state already knew which: <see cref="StagedReady"/> means downloaded and waiting,
+    /// <see cref="UpdateAvailable"/> means found but not fetched, neither means nothing has been
+    /// looked for yet.</summary>
+    public string PrimaryActionText => LabelFor(StagedReady, UpdateAvailable);
+
+    /// <summary>The label as a function of the state, callable without a view model. This class
+    /// cannot be constructed in a test — its constructor reads the real per-user settings file and
+    /// starts the background update loop — and the one thing here worth pinning is which of the two
+    /// words the player sees in each state.</summary>
+    public static string LabelFor(bool stagedReady, bool updateAvailable) =>
+        stagedReady || updateAvailable ? "Update Now" : "Check for Updates";
 
     /// <summary>The settings sheet, shown over this screen.</summary>
     public SettingsViewModel Settings { get; }
@@ -418,6 +436,31 @@ public partial class MainWindowViewModel : ObservableObject
     }
 
     private bool CanUpdate() => (UpdateAvailable || StagedReady) && !Busy;
+
+    /// <summary>What the button labelled by <see cref="PrimaryActionText"/> does. A dispatcher over
+    /// the three commands that used to have a button each, in the same precedence the label uses,
+    /// so the two cannot disagree about which one is live.
+    ///
+    /// Deliberately always executable while not busy. The commands underneath keep their own
+    /// narrower guards, but this one has to stay pressable in the "nothing found yet" state — that
+    /// is the Check case, and a disabled button there would be the common state of the screen.</summary>
+    [RelayCommand(CanExecute = nameof(CanPrimaryAction))]
+    private async Task PrimaryActionAsync()
+    {
+        if (StagedReady)
+        {
+            ApplyStaged();
+            return;
+        }
+        if (UpdateAvailable)
+        {
+            await UpdateAsync();
+            return;
+        }
+        await RefreshAsync();
+    }
+
+    private bool CanPrimaryAction() => !Busy;
 
     /// <summary>Switch to the build that was downloaded in the background. Refuses while the game
     /// is running: the swap rewrites current.json and GCs old builds, and the running game is

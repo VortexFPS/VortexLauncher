@@ -108,7 +108,7 @@ cannot touch the box and every operation goes to a runner over the protocol.
 | Download | `src/Launcher.Core/DownloadService.cs` | resumable (Range), sha256-verified — refuses checksum-less files |
 | Install | `src/Launcher.Core/InstallService.cs` | staging extract → atomic move → `current.json` flip; keeps N-1 for rollback; shared content-addressed asset store for `-core` installs |
 | Extract | `src/Launcher.Core/ArchiveExtractor.cs` | `System.IO.Compression` on Windows/Linux; `ditto` on macOS, where the managed extractor drops the `.app`'s symlinks |
-| Launch | `src/Launcher.Core/GameLauncher.cs` | spawns the game; `--data <store>` for core installs (fat installs self-resolve) |
+| Launch | `src/Launcher.Core/GameLauncher.cs` | spawns the game; `--data <store>` for core installs (complete installs self-resolve) |
 | Source build | `src/Launcher.Core/SourceProvider.cs` | clone, export, verify, package, stage; `vortex source *` in `src/Launcher.Cli/SourceCommands.cs` |
 | Engine pin | `src/Launcher.Core/GameCheckout.cs` | reads `engine.lock.json` and `export_presets.cfg` out of a checkout, and names every game-repo script the build shells out to |
 | Toolchain | `src/Launcher.Core/GodotToolchain.cs` | finds git/dotnet/python/bash and the Godot editor, and refuses an editor that is not the pinned engine |
@@ -456,8 +456,21 @@ vpk pack --packId VortexLauncher --packVersion <ver> --packDir pub --mainExe Vor
   there is no fallback to the managed path, because that fallback is what produced an install that
   looked complete and refused to launch. Residual gap: no Mac in CI, so that path has never run against
   a real bundle.
-- No settings UI — **fixed**, and now carries the channel, the install root, both update policies,
-  the notification reach and the check interval.
+- No settings UI — **fixed**. Five tabs (channel, game updates, launcher updates, notifications,
+  folders) with a pinned Cancel/Save footer, and a search box over the top that filters to matching
+  rows *across* tabs — which is why the sections are a flat self-hiding list rather than a
+  `TabControl`: one query has to be able to put the check interval and the install folder on screen
+  together, and no tab holds both. Keywords live in
+  `src/Launcher.Desktop/ViewModels/SettingsSearch.cs`, and they are the words a player would reach
+  for ("how often", "disk", "saves"), not the labels. Clicking the backdrop dismisses the sheet
+  through `CancelCommand`, so it discards edits and refuses while a relocation is in flight.
+- **The game's user directory can be opened, not moved.** The Folders tab shows it beside the
+  install location with an Open button for each. Only the install location is a picker: Godot
+  resolves `user://` itself, its `--userdir` flag takes a directory *name* rather than a path, and
+  the game's `Main.cs` parses no user-directory argument at all — so a picker there would be a
+  setting nothing could honour. `GameUserData` in `Launcher.Core` derives the path per platform;
+  moving it for real is a game-side change. Related and unfixed: `SupervisedInstance` passes an
+  absolute path to `--userdir` when it spawns a server, which Godot reads as a name.
 - **Nothing here has run against a real Velopack-installed launcher.** A commit to `stable` now
   packages one (see *Releasing the launcher*), which closes the half of this gap that was "nothing
   produces a package". What remains is that nobody has installed the `Setup.exe` and watched it

@@ -44,14 +44,17 @@ public static class PlayerCommands
             Description = "stable or beta. beta is the only channel that sees prereleases",
             DefaultValueFactory = _ => "stable",
         };
-        var fat = new Option<bool>("--fat")
+        // --fat is the old name, kept as an alias rather than dropped: it is in whatever install
+        // scripts already exist, and a flag that vanishes turns those into "unrecognised option"
+        // exits. Undocumented in the description so new scripts pick up --complete.
+        var complete = new Option<bool>("--complete", "--fat")
         {
             Description = "install the single-archive build instead of the split game/data payload",
         };
 
         var command = new Command("install", "download and install the game");
         command.Options.Add(channel);
-        command.Options.Add(fat);
+        command.Options.Add(complete);
 
         command.SetAction(async (parse, ct) =>
         {
@@ -79,7 +82,7 @@ public static class PlayerCommands
                 output.Progress($"{p.Phase} {p.Fraction:P0}"));
 
             var state = await installs.InstallAsync(
-                manifest, platformKey, preferCore: !parse.GetValue(fat), progress, ct);
+                manifest, platformKey, preferCore: !parse.GetValue(complete), progress, ct);
 
             return output.Ok(
                 new { version = state.Version, layout = state.Layout, dir = installs.GameDirOf(state) },
@@ -131,8 +134,10 @@ public static class PlayerCommands
             var progress = new Progress<(string Phase, double Fraction)>(p =>
                 output.Progress($"{p.Phase} {p.Fraction:P0}"));
 
+            // Stay on whatever layout is already installed. InstalledState normalizes the old "fat"
+            // spelling on read, so a marker written before the rename compares correctly here.
             var state = await installs.InstallAsync(manifest, PlatformKey.Current,
-                preferCore: installed?.Layout != InstalledState.LayoutFat, progress, ct);
+                preferCore: installed?.Layout != InstalledState.LayoutComplete, progress, ct);
 
             return output.Ok(
                 new { version = state.Version, layout = state.Layout },
