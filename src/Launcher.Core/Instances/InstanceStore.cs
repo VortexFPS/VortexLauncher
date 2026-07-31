@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text.Json;
 using Launcher.Protocol;
@@ -201,17 +202,39 @@ public sealed class PortPool(InstanceStore store, int first = 26000, int last = 
     }
 
     /// <summary>Both protocols. The game binds UDP, but a TCP listener on the same number is a strong
-    /// hint that something else owns it.</summary>
+    /// hint that something else owns it.
+    ///
+    /// Asked by reading the OS listener tables rather than by binding the port and seeing whether it
+    /// worked. Binding was the obvious implementation and it was wrong twice over:
+    ///
+    /// It races the thing it is checking for. A probe that binds a port to prove it is free HOLDS
+    /// that port for as long as the probe lives, so a server starting at the same moment loses to
+    /// the check that exists to help it — and the failure presents as a game that could not start.
+    ///
+    /// It made every developer running the test suite dismiss host-firewall prompts. A wildcard bind
+    /// is a listening socket as far as Windows Defender Firewall is concerned, so a probe on
+    /// 0.0.0.0 raised a prompt for whichever binary ran it, including the test host. Narrowing the
+    /// probe to loopback would have silenced that at the cost of the answer: a port free on loopback
+    /// can still be taken on the interface a dedicated server actually binds.
+    ///
+    /// The listener tables have neither problem. They see every interface, they take nothing, and
+    /// they are what <c>netstat</c> reads. The one thing they do not cover is a socket bound with
+    /// SO_REUSEADDR by something that has not begun listening, which is not a case any game server
+    /// on this box produces.</summary>
     public static bool IsFree(int port)
     {
         try
         {
-            using var udp = new UdpClient(new IPEndPoint(IPAddress.Any, port));
-            return true;
+            var properties = IPGlobalProperties.GetIPGlobalProperties();
+            return !properties.GetActiveUdpListeners().Any(e => e.Port == port)
+                && !properties.GetActiveTcpListeners().Any(e => e.Port == port);
         }
-        catch (SocketException)
+        catch (NetworkInformationException)
         {
-            return false;
+            // The tables were unreadable. Reporting the port free is the right way to fail here: the
+            // caller goes on to start a server, and a real conflict then surfaces as the bind error
+            // it actually is, rather than as this pool refusing every port on the box.
+            return true;
         }
     }
 

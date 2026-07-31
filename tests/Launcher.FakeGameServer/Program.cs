@@ -50,9 +50,10 @@ public static class Program
         UdpClient socket;
         try
         {
-            // 0.0.0.0 like the real server, not loopback: the printed bind line has to be true, and a
-            // fixture that only ever answered on loopback would pass tests a real deployment fails.
-            socket = new UdpClient(new IPEndPoint(IPAddress.Any, options.Port));
+            // Loopback unless FAKE_BIND says otherwise — see FakeServerOptions.BindAddress for why
+            // that default was reversed. The printed line below reports where it actually landed, so
+            // it stays true either way.
+            socket = new UdpClient(new IPEndPoint(options.BindAddress, options.Port));
         }
         catch (SocketException ex)
         {
@@ -64,7 +65,7 @@ public static class Program
         var server = new FakeServer { Port = bound.Port, ExitCodeOverride = options.ExitCode };
 
         Console.WriteLine("Vortex Arena dedicated server [Launcher.FakeGameServer, not the real game]");
-        Console.WriteLine($"bound to 0.0.0.0:{bound.Port}");
+        Console.WriteLine($"bound to {bound.Address}:{bound.Port}");
         if (options.UserDir is not null)
             Console.WriteLine($"userdir {options.UserDir}");
         // Said out loud rather than assumed: a real server without this opens a window and waits for a

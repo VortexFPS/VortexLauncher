@@ -40,6 +40,21 @@ public static class GameCheckout
     public static string NuGetConfigPath(string checkout) =>
         Path.Combine(checkout, "nuget.config");
 
+    /// <summary>The Godot C# project at the checkout root, or null if it cannot be identified.
+    ///
+    /// Named rather than left to a bare `dotnet build` in the checkout directory, which is not the
+    /// same command: with both a .sln and a .csproj at the root, dotnet picks the SOLUTION, and this
+    /// repo's solution carries eight projects including the test suite. The export compiles this one
+    /// file, and the game repo's own ci.sh and ci.yml build this one file, so a pre-build that
+    /// compiles a wider set can fail on code the export never touches, which is the opposite of the
+    /// fail-early it exists for. Godot generates exactly one csproj at a project root, so "the single
+    /// root csproj" finds it without hard-coding the game's name into the launcher.</summary>
+    public static string? GameProject(string checkout)
+    {
+        var roots = Directory.Exists(checkout) ? Directory.GetFiles(checkout, "*.csproj") : [];
+        return roots.Length == 1 ? roots[0] : null;
+    }
+
     /// <summary>Where an export preset writes, and what package.sh then fills in.</summary>
     public static string DistDir(string checkout, string preset) =>
         Path.Combine(checkout, "dist", preset);

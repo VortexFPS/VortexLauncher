@@ -16,7 +16,8 @@ public static class BuildProviders
 public sealed record BuildRecord
 {
     /// <summary>Stable identity. A release build's id is its version; a source build's is
-    /// "source:{ref}@{sha7}". Ids are not path-safe, which is why <see cref="DirName"/> exists.</summary>
+    /// "source:{preset}:{ref}@{sha7}". Ids are not path-safe, which is why <see cref="DirName"/>
+    /// exists.</summary>
     public required string Id { get; init; }
 
     /// <summary>Directory under <see cref="LauncherPaths.VersionsDir"/> holding this build.</summary>

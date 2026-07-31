@@ -26,7 +26,13 @@ public static class ReleaseChannels
 /// <summary>Player-owned launcher preferences, persisted as settings.json.</summary>
 public sealed record LauncherSettings
 {
-    public int Schema { get; init; } = 1;
+    /// <summary>2 added the update and notification block. Nothing reads this to branch — every new
+    /// field defaults to what a schema-1 file implies — but a file that has been through this
+    /// launcher is worth being able to recognise, and the next migration that cannot be expressed as
+    /// a default will need it.</summary>
+    public const int CurrentSchema = 2;
+
+    public int Schema { get; init; } = CurrentSchema;
 
     /// <summary>See <see cref="ReleaseChannels"/>.</summary>
     public string Channel { get; init; } = ReleaseChannels.Stable;
@@ -34,12 +40,40 @@ public sealed record LauncherSettings
     /// <summary>Override for <see cref="LauncherPaths"/>'s root; null means the per-user default.</summary>
     public string? InstallRoot { get; init; }
 
+    /// <summary>See <see cref="GameUpdateModes"/>.</summary>
+    public string GameUpdates { get; init; } = GameUpdateModes.Download;
+
+    /// <summary>See <see cref="LauncherUpdateModes"/>.</summary>
+    public string LauncherUpdates { get; init; } = LauncherUpdateModes.Automatic;
+
+    /// <summary>See <see cref="NotificationReaches"/>. Defaults to unset so first run asks; it is the
+    /// one preference here with no defensible default, because the answer turns on whether the player
+    /// wants a resident process and nothing on disk can tell the launcher that.</summary>
+    public string NotificationReach { get; init; } = NotificationReaches.Unset;
+
+    /// <summary>Minutes between background feed checks; see <see cref="UpdateCheckInterval"/>.</summary>
+    public int UpdateCheckMinutes { get; init; } = UpdateCheckInterval.DefaultMinutes;
+
+    /// <summary>Start the launcher when the player logs in. Only meaningful under the background
+    /// reach — a launcher that autostarts to show a window nobody asked for is a nuisance, so the
+    /// two are set together and cleared together.</summary>
+    public bool StartWithSystem { get; init; }
+
     /// <summary>Derived from <see cref="Channel"/>, and kept out of the file for that reason: a
     /// serialized copy is a second source of truth that only ever drifts. Someone editing the file by
     /// hand to leave beta would flip "channel" and leave this reading true, and the next reader has to
     /// know which one loses. Nothing can disagree with the channel if the channel is the only thing
     /// written.</summary>
     [JsonIgnore] public bool IsBeta => ReleaseChannels.IsBeta(Channel);
+
+    /// <summary>Same rule as <see cref="IsBeta"/>: read off the stored reach, never stored beside it.</summary>
+    [JsonIgnore] public bool WantsSystemNotifications =>
+        NotificationReaches.WantsSystemNotifications(NotificationReach);
+
+    [JsonIgnore] public bool WantsTray => NotificationReaches.WantsTray(NotificationReach);
+
+    [JsonIgnore] public bool HasChosenNotificationReach =>
+        NotificationReaches.IsChosen(NotificationReach);
 }
 
 /// <summary>Reads and writes settings.json.
@@ -71,10 +105,23 @@ public sealed class LauncherSettingsStore
             var loaded = JsonSerializer.Deserialize<LauncherSettings>(
                 File.ReadAllText(FilePath), ReleaseManifest.JsonOptions) ?? new LauncherSettings();
 
+            // Every string field goes through its own Normalize on the way in, so the rest of the
+            // launcher can switch on these values without a default arm that means "corrupt file".
+            // A schema-1 file simply has none of the update fields and picks up the defaults, which
+            // is the whole migration: notify-reach lands on unset, so those players get asked once.
             return loaded with
             {
+                Schema = LauncherSettings.CurrentSchema,
                 Channel = ReleaseChannels.Normalize(loaded.Channel),
                 InstallRoot = string.IsNullOrWhiteSpace(loaded.InstallRoot) ? null : loaded.InstallRoot.Trim(),
+                GameUpdates = GameUpdateModes.Normalize(loaded.GameUpdates),
+                LauncherUpdates = LauncherUpdateModes.Normalize(loaded.LauncherUpdates),
+                NotificationReach = NotificationReaches.Normalize(loaded.NotificationReach),
+                UpdateCheckMinutes = UpdateCheckInterval.Normalize(loaded.UpdateCheckMinutes),
+                // A tray-only setting left true after the player moved off the background reach would
+                // autostart a launcher that no longer has a reason to be resident.
+                StartWithSystem = loaded.StartWithSystem
+                    && NotificationReaches.WantsTray(loaded.NotificationReach),
             };
         }
         catch (JsonException)

@@ -60,6 +60,16 @@ so the workflow leans on `BuildStore.List()` adopting a directory with no entry 
 same path that keeps an install made before that file existed from being orphaned; `vortex builds list`
 and `vortex builds pin` then confirm the store took it. There is no test-only hook in production code.
 
+The fixture binds **loopback**, not `0.0.0.0`. It used to do the opposite, on the grounds that a
+stand-in should be shaped like the real server, and the cost of that landed on every developer who
+ran `dotnet test`: Windows raises a firewall prompt for each new binary that listens on a public
+interface, and this suite starts a server process per test. The fidelity was thin — the fixture
+implements a contract, not a deployment, and everything that probes it (the supervisor's `getinfo`,
+the nightly e2e) does so from the same machine. `FAKE_BIND=0.0.0.0` puts the wider bind back.
+`PortPool.IsFree` moved off a wildcard bind for the same reason and gained something better than
+quiet: it reads the OS listener tables instead, so it no longer races the server it is checking for
+by holding the port it just declared free.
+
 Three things it deliberately leaves uncovered:
 
 - **The real game binary.** No Godot on a runner. The fixture implements the whole of the supervisor's
@@ -103,10 +113,69 @@ cannot touch the box and every operation goes to a runner over the protocol.
 | Engine pin | `src/Launcher.Core/GameCheckout.cs` | reads `engine.lock.json` and `export_presets.cfg` out of a checkout, and names every game-repo script the build shells out to |
 | Toolchain | `src/Launcher.Core/GodotToolchain.cs` | finds git/dotnet/python/bash and the Godot editor, and refuses an editor that is not the pinned engine |
 | Artifact names | `src/Launcher.Core/LauncherConfig.cs` | the accepted release-artifact prefixes; see the rename note below |
-| Self-update | `src/Launcher.Desktop/SelfUpdateService.cs` | Velopack against this repo's releases |
+| Update policy | `src/Launcher.Core/UpdatePolicy.cs` | the setting vocabularies and what an unrecognised value is allowed to mean |
+| Update check | `src/Launcher.Core/UpdateCheck.cs` | one verdict type, the polling loop, and once-per-version announcement |
+| Self-update | `src/Launcher.Desktop/SelfUpdateService.cs` | Velopack against this repo's releases; check and restart are separate |
+| Notifications | `src/Launcher.Desktop/Notifications/` | OS notification per platform, or silence under the in-app reach |
 
 Invariants (ADR-0015 §6): never gate Play on the network; verify before swap; resume
 interrupted downloads; keep the previous version.
+
+## Updating: the game, the launcher, and being told
+
+Three separate questions, three separate settings, all in `settings.json` (schema 2) and all on the
+Settings sheet. A schema-1 file needs no migration: every new field defaults to what its absence
+implied.
+
+**The game** (`gameUpdates`) defaults to `download` — fetch a new release in the background, then
+ask before switching to it. That split is the reason `InstallService` grew `StageAsync`/`Apply`: the
+install already did all its expensive, failure-prone work out-of-tree with a single
+`Directory.Move` between it and live (verify-before-swap, ADR-0015 §6), so stopping short of the
+`current.json` flip costs nothing and buys a build that is downloaded and *not yet* the one Play
+launches. `install` skips the asking; `notify` touches the network only when the player presses
+Update. With nothing installed, all three install immediately — there is no session to protect and
+prompting would just be a click between the player and a game they have none of.
+
+**The launcher** (`launcherUpdates`) defaults to `automatic` and can be turned off, which is a
+player's call to make and a real hazard worth stating: `latest.json` is a cross-repo contract, so a
+launcher left far enough behind can lose the ability to read the game's feed at all. `off` therefore
+still *checks* and still reports the gap; it just does not act. Two bugs in the original
+`SelfUpdateService` are fixed here — it called `ApplyUpdatesAndRestart` from a fire-and-forget
+startup check, which terminates the process with no regard for an install in flight, and it passed
+`prerelease: true` unconditionally, serving prerelease launchers to players on the stable channel.
+Checking and restarting are now separate calls and the restart is gated on nothing being in flight.
+
+**Being told** (`notificationReach`) is the one preference with no defensible default, because the
+honest answer turns on whether the player wants a resident process — which nothing on disk can say.
+So it is the single question first run asks, and until it is answered nothing notifies:
+
+| Reach | What it costs | What it gets |
+|---|---|---|
+| `in-app` | nothing | a banner, next time the launcher is opened |
+| `system` | a notification per new version | a native OS notification while the launcher runs |
+| `background` | a tray-resident process, optionally started at login | notice without the launcher being open |
+
+`SystemNotifier` shells out per platform — `notify-send`, `osascript`, and a PowerShell/WinRT toast
+on Windows — rather than binding an OS API, because the maintained Windows toast package
+(`CommunityToolkit.WinUI.Notifications`) ships only for a `net8.0-windows10.0.x` target framework,
+and taking it would force this project to multi-target and put a Windows-only TFM in a launcher that
+builds on Linux CI. Payloads cross as environment variables, never interpolated into a command line:
+the text carries a release version, and a release is exactly as trustworthy as the release process —
+the same reasoning that put release-note links behind `SafeLinkPolicy`. Two caveats, both inherent
+to shelling out: on macOS the notification is attributed to whatever owns `osascript` rather than to
+the launcher, and on Windows a toast is attributed to an AppUserModelID, so it is inert for a
+`dotnet run` dev build with no Start Menu shortcut — the same shape as self-update. Anything that
+fails degrades to the banner, which has already said the same thing.
+
+Background checks run on a loop, not a timer, so a slow connection cannot stack a second check on
+top of the first. The interval (`updateCheckMinutes`, default 240) has a 15-minute floor for a
+reason: the beta channel asks `GitHubApiFeed` *first* (`ChannelFeeds`), and that is unauthenticated
+GitHub API at 60 requests/hour.
+
+**Not covered:** the CLI. `vortex install`/`update` still read `LauncherHttp.DefaultFeed` directly
+and honour neither `channel` nor any of these settings — `vortex update --check` is the only
+scheduling primitive it offers, and nothing in this repo schedules it. A box running `vortex runner
+run` does not auto-update its game builds.
 
 ## Runner metrics
 
@@ -237,6 +306,11 @@ makes them a contract: renaming one, or changing `engine.lock.json`'s shape, bre
 this repo. `GameCheckout` is the single place that names them, and a checkout missing one fails saying
 which file and that the ref predates the tooling.
 
+Two more files are read and are deliberately *not* in that list, because neither breaks on a rename:
+`nuget.config`, whose dev-local package sources are dropped when the directory they point at is not on
+this box, and the single `.csproj` at the checkout root, which the pre-build compiles by name because a
+bare `dotnet build` in that directory picks the *solution* over it and drags in the game's test suite.
+
 Two consequences worth knowing before touching either side:
 
 - **`ManifestFeed` reads `/releases/latest/download/latest.json`**, and GitHub resolves
@@ -296,7 +370,16 @@ vpk pack -u VortexLauncher -v <ver> -p pub -e VortexLauncher.exe
   there is no fallback to the managed path, because that fallback is what produced an install that
   looked complete and refused to launch. Residual gap: no Mac in CI, so that path has never run against
   a real bundle.
-- No settings UI (channel pinning, install-root override) — `LauncherPaths` accepts an override, nothing exposes it.
+- No settings UI — **fixed**, and now carries the channel, the install root, both update policies,
+  the notification reach and the check interval.
+- **Nothing here has run against a real Velopack-installed launcher**, because nothing packages one
+  yet (ADR-0015 §7, still deferred). The self-update paths are guarded by `UpdateManager.IsInstalled`
+  and are inert without it, so what is exercised today is the check, the mode branching and the
+  restart gate — not an actual restart into a new build. The Windows toast has the same gap for the
+  same reason: it wants the Start Menu shortcut a Velopack install creates.
+- **The tray reach is the least exercised of the three.** Close-to-tray, the tray menu and autostart
+  registration are written and build, but autostart has only been reasoned about per platform, not
+  run: `reg.exe` on Windows, `~/.config/autostart` on Linux, a LaunchAgent plist on macOS.
 - Release notes markdown — **fixed**. `MarkdownView` (`src/Launcher.Desktop/Controls/MarkdownView.cs`)
   renders headings, emphasis, inline and fenced code, bullet and numbered lists, rules and links;
   anything outside that list falls through as literal text, so a construct it does not know shows up

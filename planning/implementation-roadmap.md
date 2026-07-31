@@ -264,9 +264,21 @@ release.yml closed for CI and the launcher had no business reopening. Engine ske
 both versions. Verified end to end on Windows against the real lockfile, template and scripts: the
 exported binary came back with `GetRawInputBuffer present (1x)`, so it carried the patched engine.
 
+A later check found a third error, and it was the same mistake one layer down: staging into the build
+store had been verified, and being *usable from* the build store had been assumed. `builds pin` on a
+source build exited 0 and did nothing. `current.json` recorded only the version and the game directory
+resolved as `versions/<version>/<root>`, an identity that holds for a release build (id, version and
+directory name are one string) and breaks for a source build, whose id is
+`source:<preset>:<ref>@<sha7>`, whose directory is a flattened form of that, and whose version is the
+sha alone. The marker pointed at `versions/<sha7>/`, which never exists, so `vortex launch` answered
+"nothing installed", `builds list` never marked it current, and `builds gc` (which protects the pinned
+build by id and was handed the version) treated the pinned source build as reclaimable. `current.json`
+now carries the build id and directory name beside the version, both optional so markers written before
+this still load, and `InstallServiceTests` pins a build whose three names differ.
+
 Still open: no `runner-api-v1.yaml` operation and no panel screen, so this is CLI-only; no automated
-test, because the pipeline's inputs are a Godot editor and a multi-gigabyte checkout and the CI runner
-has neither; and no macOS run of the `.app` bundle path.
+test of the pipeline itself, because its inputs are a Godot editor and a multi-gigabyte checkout and
+the CI runner has neither; and no macOS run of the `.app` bundle path.
 
 **LNCH-7. Sign manifests with minisign.** ADR-0015 names this as the gate before launcher-managed
 installs become the default path. Until it exists, install integrity rests on sha256 values fetched from

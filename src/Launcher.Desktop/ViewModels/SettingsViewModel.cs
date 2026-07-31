@@ -34,6 +34,39 @@ public partial class SettingsViewModel : ObservableObject
     [NotifyPropertyChangedFor(nameof(StableChannel))]
     private bool _betaChannel;
 
+    // ── game updates ───────────────────────────────────────────────────────────────────────────
+    [ObservableProperty] private bool _gameNotifyOnly;
+    [ObservableProperty] private bool _gameDownloadThenAsk = true;
+    [ObservableProperty] private bool _gameFullyAutomatic;
+
+    // ── launcher updates ───────────────────────────────────────────────────────────────────────
+    [ObservableProperty] private bool _launcherAutomatic = true;
+    [ObservableProperty] private bool _launcherNotifyOnly;
+
+    /// <summary>The off switch. Its warning is in the view rather than here, but the reason it has
+    /// one: <c>latest.json</c> is a cross-repo contract, so a launcher left far enough behind can
+    /// lose the ability to read the game's release feed at all.</summary>
+    [ObservableProperty] private bool _launcherUpdatesOff;
+
+    // ── notifications ──────────────────────────────────────────────────────────────────────────
+    [ObservableProperty] private bool _inAppReach = true;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(StartWithSystemEnabled))]
+    private bool _systemReach;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(StartWithSystemEnabled))]
+    private bool _backgroundReach;
+
+    [ObservableProperty] private bool _startWithSystem;
+
+    /// <summary>Minutes between background checks, as text because it is bound to a TextBox and an
+    /// empty box during editing must not read as zero (which means "startup only").</summary>
+    [ObservableProperty] private string _checkIntervalText = "";
+
+    public bool StartWithSystemEnabled => BackgroundReach;
+
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(InstallRootHint))]
     private string _installRootText = "";
@@ -210,10 +243,30 @@ public partial class SettingsViewModel : ObservableObject
             _moveConfirmed = false;
         }
 
+        var reach = BackgroundReach ? NotificationReaches.Background
+            : SystemReach ? NotificationReaches.System
+            : NotificationReaches.InApp;
+
+        // Applied before the save so a failure can be reflected in what gets stored, the same way
+        // the first-run sheet does it: the file must never claim a login entry that was not written.
+        var wantsAutostart = reach == NotificationReaches.Background && StartWithSystem;
+        var autostartProblem = wantsAutostart != (_saved.StartWithSystem && _saved.WantsTray)
+            ? Autostart.Set(wantsAutostart)
+            : null;
+
         var settings = _saved with
         {
             Channel = BetaChannel ? ReleaseChannels.Beta : ReleaseChannels.Stable,
             InstallRoot = chosen,
+            GameUpdates = GameNotifyOnly ? GameUpdateModes.Notify
+                : GameFullyAutomatic ? GameUpdateModes.Install
+                : GameUpdateModes.Download,
+            LauncherUpdates = LauncherUpdatesOff ? LauncherUpdateModes.Off
+                : LauncherNotifyOnly ? LauncherUpdateModes.Notify
+                : LauncherUpdateModes.Automatic,
+            NotificationReach = reach,
+            UpdateCheckMinutes = ParsedInterval(),
+            StartWithSystem = wantsAutostart && autostartProblem is null,
         };
 
         try
@@ -241,10 +294,14 @@ public partial class SettingsViewModel : ObservableObject
         _saved = settings;
         Applied?.Invoke(settings);
 
-        if (warnings.Count > 0)
+        var notes = warnings.ToList();
+        if (autostartProblem is not null)
+            notes.Add(autostartProblem);
+
+        if (notes.Count > 0)
         {
             // Saved and applied, but something needs saying — keep the sheet up so it gets read.
-            StatusText = "Saved. " + string.Join(" ", warnings);
+            StatusText = "Saved. " + string.Join(" ", notes);
             return;
         }
 
@@ -258,10 +315,50 @@ public partial class SettingsViewModel : ObservableObject
     {
         BetaChannel = _saved.IsBeta;
         InstallRootText = _saved.InstallRoot ?? LauncherSettingsStore.DefaultRoot;
+
+        var game = GameUpdateModes.Normalize(_saved.GameUpdates);
+        GameNotifyOnly = game == GameUpdateModes.Notify;
+        GameDownloadThenAsk = game == GameUpdateModes.Download;
+        GameFullyAutomatic = game == GameUpdateModes.Install;
+
+        var launcher = LauncherUpdateModes.Normalize(_saved.LauncherUpdates);
+        LauncherAutomatic = launcher == LauncherUpdateModes.Automatic;
+        LauncherNotifyOnly = launcher == LauncherUpdateModes.Notify;
+        LauncherUpdatesOff = launcher == LauncherUpdateModes.Off;
+
+        // Unset shows as in-app: the sheet is a set of radio buttons and one of them has to be on.
+        // It stays unset on disk until Save, so a player who opens Settings and cancels still gets
+        // the first-run question.
+        var reach = NotificationReaches.Normalize(_saved.NotificationReach);
+        InAppReach = reach is NotificationReaches.InApp or NotificationReaches.Unset;
+        SystemReach = reach == NotificationReaches.System;
+        BackgroundReach = reach == NotificationReaches.Background;
+        StartWithSystem = _saved.StartWithSystem;
+
+        CheckIntervalText = _saved.UpdateCheckMinutes == UpdateCheckInterval.Never
+            ? "0"
+            : _saved.UpdateCheckMinutes.ToString();
+
         StatusText = "";
         ConfirmVisible = false;
         _moveConfirmed = false;
     }
+
+    /// <summary>Adopt settings changed somewhere else — the first-run sheet writes the same file,
+    /// and this one must not overwrite that choice with the copy it loaded at construction.</summary>
+    public void Reload(LauncherSettings settings)
+    {
+        _saved = settings;
+        if (!IsOpen)
+            LoadFromSaved();
+    }
+
+    /// <summary>Blank or unparseable keeps whatever was saved rather than silently becoming 0,
+    /// which would mean "stop checking" — a typo must not turn background checks off.</summary>
+    private int ParsedInterval() =>
+        int.TryParse(CheckIntervalText.Trim(), out var minutes)
+            ? UpdateCheckInterval.Normalize(minutes)
+            : _saved.UpdateCheckMinutes;
 
     /// <summary>Blank, or the default root itself, stores as null so the setting keeps tracking the
     /// platform default instead of freezing today's expansion of it.</summary>

@@ -1,0 +1,67 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Launcher.Desktop.ViewModels"
+             x:Class="Launcher.Desktop.Views.FirstRunView"
+             x:DataType="vm:FirstRunViewModel">
+
+  <Border Background="#161b26" BorderBrush="#263043" BorderThickness="1" CornerRadius="10"
+          Padding="20" Margin="24" MaxWidth="600" HorizontalAlignment="Center"
+          VerticalAlignment="Center">
+    <ScrollViewer>
+      <StackPanel Spacing="16">
+
+        <TextBlock Text="HOW SHOULD WE TELL YOU ABOUT UPDATES?" FontSize="11"
+                   Foreground="#5a6478" FontWeight="Bold"/>
+
+        <TextBlock TextWrapping="Wrap" Foreground="#aeb7c6" FontSize="13"
+                   Text="Vortex Arena updates fairly often, and matches want everyone on the same build. Pick how far a &quot;there's a new version&quot; notice is allowed to travel — you can change this later in Settings."/>
+
+        <StackPanel Spacing="10">
+          <RadioButton GroupName="reach" IsChecked="{Binding InAppReach}" Foreground="#aeb7c6">
+            <StackPanel Spacing="2">
+              <TextBlock Text="Only inside the launcher" Foreground="#e8ecf4"/>
+              <TextBlock Text="A banner when you open it. Nothing runs in the background and nothing else on your desktop changes."
+                         TextWrapping="Wrap" Foreground="#8892a6" FontSize="12"/>
+            </StackPanel>
+          </RadioButton>
+
+          <RadioButton GroupName="reach" IsChecked="{Binding SystemReach}" Foreground="#aeb7c6">
+            <StackPanel Spacing="2">
+              <TextBlock Text="Desktop notifications while the launcher is open" Foreground="#e8ecf4"/>
+              <TextBlock Text="The banner, plus a normal system notification. Still nothing running once you close the launcher."
+                         TextWrapping="Wrap" Foreground="#8892a6" FontSize="12"/>
+            </StackPanel>
+          </RadioButton>
+
+          <RadioButton GroupName="reach" IsChecked="{Binding BackgroundReach}" Foreground="#aeb7c6">
+            <StackPanel Spacing="2">
+              <TextBlock Text="Keep checking in the background" Foreground="#e8ecf4"/>
+              <TextBlock Text="Closing the window leaves the launcher in the tray so it can tell you about a new version without being open. Quit it from the tray menu."
+                         TextWrapping="Wrap" Foreground="#8892a6" FontSize="12"/>
+            </StackPanel>
+          </RadioButton>
+
+          <CheckBox IsChecked="{Binding StartWithSystem}" IsEnabled="{Binding StartWithSystemEnabled}"
+                    Content="Start the launcher when I log in" Foreground="#aeb7c6"
+                    Margin="24,0,0,0"/>
+        </StackPanel>
+
+        <Border Background="#1d2433" CornerRadius="8" Padding="12">
+          <StackPanel Spacing="4">
+            <TextBlock Text="What happens by default" Foreground="#e8ecf4" FontSize="12"
+                       FontWeight="SemiBold"/>
+            <TextBlock TextWrapping="Wrap" Foreground="#8892a6" FontSize="12"
+                       Text="New game versions download in the background so Play stays instant, and the launcher asks before switching you over. The launcher keeps itself up to date. Both are in Settings if you want something else."/>
+          </StackPanel>
+        </Border>
+
+        <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" Foreground="#ffd43b" FontSize="12"
+                   IsVisible="{Binding StatusText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+
+        <Button Content="Continue" Command="{Binding ConfirmCommand}" Padding="22,8"
+                HorizontalAlignment="Right" Background="#2a72b5" Foreground="White"/>
+
+      </StackPanel>
+    </ScrollViewer>
+  </Border>
+</UserControl>

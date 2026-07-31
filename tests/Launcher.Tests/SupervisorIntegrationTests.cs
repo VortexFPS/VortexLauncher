@@ -96,7 +96,10 @@ public class SupervisorIntegrationTests : ScratchTest
         // Waited for on the server's own bind line rather than by polling the port: a poll that binds
         // the port to test it can win the race against the server that is about to, and the failure
         // would look like a game that could not start.
-        await WaitForLineAsync(harness, line => line.Text.Contains($"bound to 0.0.0.0:{harness.Port}"),
+        // Matched on the port alone, not on the full address: where the fixture binds is a FAKE_BIND
+        // decision and this test is about the port being held, not about which interface holds it.
+        await WaitForLineAsync(harness, line => line.Text.Contains($"bound to ")
+                                             && line.Text.EndsWith($":{harness.Port}", StringComparison.Ordinal),
             "the fixture to report its bind");
 
         // Both halves have to hold at once, or this test passes for the wrong reason: a process that
@@ -745,10 +748,13 @@ public class SupervisorIntegrationTests : ScratchTest
 
     /// <summary>Take an ephemeral port from the OS and hand it straight back. Ports are never
     /// hardcoded here: a fixed number collides with whatever else the box is running and turns an
-    /// unrelated service into a test failure.</summary>
+    /// unrelated service into a test failure.
+    ///
+    /// Loopback, matching where the fixture binds — and matching it for the same reason the fixture
+    /// does: binding 0.0.0.0 here made Windows Defender Firewall prompt for the test host itself.</summary>
     private static int FreeUdpPort()
     {
-        using var probe = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
+        using var probe = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
         return ((IPEndPoint)probe.Client.LocalEndPoint!).Port;
     }
 

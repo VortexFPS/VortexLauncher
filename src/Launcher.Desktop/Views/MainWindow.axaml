@@ -11,7 +11,7 @@
         Background="#0d1017">
 
   <Panel>
-    <Grid RowDefinitions="Auto,*,Auto,Auto" Margin="24">
+    <Grid RowDefinitions="Auto,Auto,*,Auto,Auto" Margin="24">
 
       <!-- header -->
       <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="0,0,0,16">
@@ -23,8 +23,21 @@
                 Padding="14,6" VerticalAlignment="Center"/>
       </Grid>
 
+      <!-- The update banner. Separate from the status line below because that line is rewritten by
+           every download tick, and a "there is a new version" notice has to outlive that. -->
+      <Border Grid.Row="1" IsVisible="{Binding BannerVisible}" Margin="0,0,0,14"
+              Background="#1d2f45" BorderBrush="#2a72b5" BorderThickness="1" CornerRadius="8"
+              Padding="14,10">
+        <Grid ColumnDefinitions="*,Auto">
+          <TextBlock Grid.Column="0" Text="{Binding BannerText}" Foreground="#cfe4f7"
+                     TextWrapping="Wrap" VerticalAlignment="Center"/>
+          <Button Grid.Column="1" Content="Dismiss" Command="{Binding DismissBannerCommand}"
+                  Padding="12,4" Background="Transparent" Foreground="#8fb6dd"/>
+        </Grid>
+      </Border>
+
       <!-- body: install state | release notes -->
-      <Grid Grid.Row="1" ColumnDefinitions="260,16,*">
+      <Grid Grid.Row="2" ColumnDefinitions="260,16,*">
         <StackPanel Grid.Column="0" Spacing="10">
           <Border Background="#161b26" CornerRadius="8" Padding="14">
             <StackPanel Spacing="4">
@@ -56,29 +69,56 @@
       </Grid>
 
       <!-- progress + status -->
-      <StackPanel Grid.Row="2" Spacing="6" Margin="0,14,0,10">
+      <StackPanel Grid.Row="3" Spacing="6" Margin="0,14,0,10">
         <ProgressBar Value="{Binding Progress}" Maximum="100"
                      IsVisible="{Binding ProgressVisible}" Height="6" CornerRadius="3"/>
         <TextBlock Text="{Binding StatusText}" Foreground="#8892a6" FontSize="12"
                    TextWrapping="Wrap"/>
+
+        <!-- The launcher's own update, kept away from the game's controls: they update on separate
+             trains and conflating them is how a player ends up pressing Update expecting a game. -->
+        <StackPanel Orientation="Horizontal" Spacing="10"
+                    IsVisible="{Binding SelfUpdateText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+          <TextBlock Text="{Binding SelfUpdateText}" Foreground="#5a6478" FontSize="11"
+                     VerticalAlignment="Center" TextWrapping="Wrap"/>
+          <Button Content="Download" Command="{Binding DownloadLauncherUpdateCommand}"
+                  IsVisible="{Binding LauncherUpdatePending}" Padding="10,2" FontSize="11"/>
+          <Button Content="Restart to finish" Command="{Binding RestartForLauncherUpdateCommand}"
+                  IsVisible="{Binding LauncherUpdateReady}" Padding="10,2" FontSize="11"/>
+        </StackPanel>
       </StackPanel>
 
       <!-- actions -->
-      <StackPanel Grid.Row="3" Orientation="Horizontal" Spacing="10" HorizontalAlignment="Right">
-        <Button Content="Check again" Command="{Binding RefreshCommand}" Padding="16,8"/>
-        <Button Content="Cancel" Command="{Binding CancelCommand}" Padding="16,8"
-                IsVisible="{Binding Busy}"/>
-        <Button Content="Update" Command="{Binding UpdateCommand}" Padding="16,8"
-                Background="#2a72b5" Foreground="White"/>
-        <Button Content="PLAY" Command="{Binding PlayCommand}" Padding="28,8"
-                FontWeight="Bold" Background="#2f9e44" Foreground="White"/>
-      </StackPanel>
+      <Grid Grid.Row="4" ColumnDefinitions="*,Auto">
+        <!-- The downloaded-and-waiting state, which is what the default update mode produces. -->
+        <TextBlock Grid.Column="0" Text="{Binding StagedText}" IsVisible="{Binding StagedReady}"
+                   Foreground="#8fd4a0" FontSize="12" VerticalAlignment="Center"
+                   TextWrapping="Wrap" Margin="0,0,12,0"/>
+
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10" HorizontalAlignment="Right">
+          <Button Content="Check again" Command="{Binding RefreshCommand}" Padding="16,8"/>
+          <Button Content="Cancel" Command="{Binding CancelCommand}" Padding="16,8"
+                  IsVisible="{Binding Busy}"/>
+          <Button Content="Switch now" Command="{Binding ApplyStagedCommand}" Padding="16,8"
+                  IsVisible="{Binding StagedReady}" Background="#2a72b5" Foreground="White"/>
+          <Button Content="Update" Command="{Binding UpdateCommand}" Padding="16,8"
+                  IsVisible="{Binding !StagedReady}" Background="#2a72b5" Foreground="White"/>
+          <Button Content="PLAY" Command="{Binding PlayCommand}" Padding="28,8"
+                  FontWeight="Bold" Background="#2f9e44" Foreground="White"/>
+        </StackPanel>
+      </Grid>
     </Grid>
 
     <!-- Settings as a sheet over this window rather than a second one: choosing where the game
          installs reads better with what is installed still on screen behind it. -->
     <Border Background="#f00d1017" IsVisible="{Binding Settings.IsOpen}">
       <views:SettingsView DataContext="{Binding Settings}"/>
+    </Border>
+
+    <!-- Over everything, including Settings: this is asked once, before anything has had a chance
+         to notify, so that the first notification a player sees is never one they had no say in. -->
+    <Border Background="#f80d1017" IsVisible="{Binding FirstRun.IsOpen}">
+      <views:FirstRunView DataContext="{Binding FirstRun}"/>
     </Border>
   </Panel>
 </Window>

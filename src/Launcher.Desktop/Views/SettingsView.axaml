@@ -22,6 +22,62 @@
                      TextWrapping="Wrap" Foreground="#8892a6" FontSize="12" Margin="24,2,0,0"/>
         </StackPanel>
 
+        <!-- game updates -->
+        <StackPanel Spacing="6">
+          <TextBlock Text="Game updates" Foreground="#e8ecf4" FontSize="14" FontWeight="SemiBold"/>
+          <RadioButton GroupName="gameUpdates" IsChecked="{Binding GameDownloadThenAsk}"
+                       Content="Download in the background, ask before switching (recommended)"
+                       Foreground="#aeb7c6"/>
+          <RadioButton GroupName="gameUpdates" IsChecked="{Binding GameFullyAutomatic}"
+                       Content="Download and install automatically" Foreground="#aeb7c6"/>
+          <RadioButton GroupName="gameUpdates" IsChecked="{Binding GameNotifyOnly}"
+                       Content="Just tell me — download nothing until I press Update"
+                       Foreground="#aeb7c6"/>
+          <TextBlock Text="Downloading ahead of time is what keeps Play instant; asking before the switch is what keeps a new build from landing in the middle of a session. Neither ever replaces the build a running game is using."
+                     TextWrapping="Wrap" Foreground="#8892a6" FontSize="12" Margin="24,2,0,0"/>
+        </StackPanel>
+
+        <!-- launcher updates -->
+        <StackPanel Spacing="6">
+          <TextBlock Text="Launcher updates" Foreground="#e8ecf4" FontSize="14" FontWeight="SemiBold"/>
+          <RadioButton GroupName="launcherUpdates" IsChecked="{Binding LauncherAutomatic}"
+                       Content="Keep the launcher up to date automatically (recommended)"
+                       Foreground="#aeb7c6"/>
+          <RadioButton GroupName="launcherUpdates" IsChecked="{Binding LauncherNotifyOnly}"
+                       Content="Tell me, and let me apply it" Foreground="#aeb7c6"/>
+          <RadioButton GroupName="launcherUpdates" IsChecked="{Binding LauncherUpdatesOff}"
+                       Content="Don't update the launcher" Foreground="#aeb7c6"/>
+          <TextBlock IsVisible="{Binding LauncherUpdatesOff}"
+                     Text="The launcher reads the game's release list through a file format that both sides have to agree on. A launcher left far enough behind can stop being able to read it — at which point it can't install or update the game either. It will still tell you when a newer launcher exists."
+                     TextWrapping="Wrap" Foreground="#ffd43b" FontSize="12" Margin="24,2,0,0"/>
+          <TextBlock IsVisible="{Binding !LauncherUpdatesOff}"
+                     Text="The launcher restarts to finish updating itself, and never does that while a download or the game is running."
+                     TextWrapping="Wrap" Foreground="#8892a6" FontSize="12" Margin="24,2,0,0"/>
+        </StackPanel>
+
+        <!-- notifications -->
+        <StackPanel Spacing="6">
+          <TextBlock Text="Update notifications" Foreground="#e8ecf4" FontSize="14" FontWeight="SemiBold"/>
+          <RadioButton GroupName="reach" IsChecked="{Binding InAppReach}"
+                       Content="Only inside the launcher" Foreground="#aeb7c6"/>
+          <RadioButton GroupName="reach" IsChecked="{Binding SystemReach}"
+                       Content="Desktop notifications while the launcher is open" Foreground="#aeb7c6"/>
+          <RadioButton GroupName="reach" IsChecked="{Binding BackgroundReach}"
+                       Content="Keep checking in the background (stays in the tray when closed)"
+                       Foreground="#aeb7c6"/>
+          <CheckBox IsChecked="{Binding StartWithSystem}" IsEnabled="{Binding StartWithSystemEnabled}"
+                    Content="Start the launcher when I log in" Foreground="#aeb7c6"
+                    Margin="24,0,0,0"/>
+          <Grid ColumnDefinitions="Auto,8,80,8,*" Margin="24,4,0,0">
+            <TextBlock Grid.Column="0" Text="Check every" Foreground="#aeb7c6" FontSize="12"
+                       VerticalAlignment="Center"/>
+            <TextBox Grid.Column="2" Text="{Binding CheckIntervalText}" FontSize="12"/>
+            <TextBlock Grid.Column="4" Text="minutes (0 = only when the launcher starts; minimum 15)"
+                       Foreground="#8892a6" FontSize="12" VerticalAlignment="Center"
+                       TextWrapping="Wrap"/>
+          </Grid>
+        </StackPanel>
+
         <!-- install location -->
         <StackPanel Spacing="6">
           <TextBlock Text="Install location" Foreground="#e8ecf4" FontSize="14" FontWeight="SemiBold"/>

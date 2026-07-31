@@ -1,3 +1,5 @@
+using System.Net;
+
 namespace Launcher.FakeGameServer;
 
 /// <summary>Everything the fixture was told to be: the arguments the runner passes, the FAKE_*
@@ -14,6 +16,10 @@ public sealed class FakeServerOptions
           --userdir <path>        instance data dir; server.cfg is executed from here if present
           +<cmd> [args...]        console command to run at startup, e.g. "+map stormkeep"
           --help                  this text
+
+        Environment, where it binds:
+          FAKE_BIND=<addr>        UDP bind address; defaults to 127.0.0.1. Set 0.0.0.0 for a
+                                  production-shaped bind (and a host firewall prompt).
 
         Environment, scripted misbehaviour:
           FAKE_CRASH_AFTER_MS=<n> exit n ms after startup, with FAKE_EXIT_CODE or 1
@@ -46,6 +52,24 @@ public sealed class FakeServerOptions
     /// forwards an instance's ExtraArgs verbatim and a fixture that refused to start on an unfamiliar
     /// flag would fail the test for the wrong reason.</summary>
     public IReadOnlyList<string> UnknownArguments { get; private init; } = [];
+
+    /// <summary>Where the UDP socket binds.
+    ///
+    /// Loopback by default, and that default is a deliberate reversal. It used to bind 0.0.0.0 on the
+    /// grounds that the fixture should be shaped like the real server — but the cost landed on every
+    /// developer who ran <c>dotnet test</c>: Windows Defender Firewall raises a prompt for each new
+    /// binary that listens on a public interface, and this suite starts a fresh server process per
+    /// test. Dozens of prompts per run, all of them for a fixture that is only ever probed from the
+    /// same machine (the supervisor's own getinfo goes to <c>IPAddress.Loopback</c>, and so does the
+    /// nightly e2e).
+    ///
+    /// The fidelity that default was buying was thin: this is a stand-in that implements a contract,
+    /// not a deployment, so listening on every interface never tested anything the real server does.
+    /// What it did test — that the port is genuinely held, that a stale process still owns it, that
+    /// the supervisor can re-probe it — is all just as true on loopback.
+    ///
+    /// <c>FAKE_BIND=0.0.0.0</c> puts it back for anyone who wants the wider bind.</summary>
+    public IPAddress BindAddress { get; private init; } = IPAddress.Loopback;
 
     public int? CrashAfterMs { get; private init; }
     public int? ExitCode { get; private init; }
@@ -117,6 +141,7 @@ public sealed class FakeServerOptions
             UserDir = userDir,
             StartupCommands = startup,
             UnknownArguments = unknown,
+            BindAddress = EnvAddress("FAKE_BIND") ?? IPAddress.Loopback,
             CrashAfterMs = EnvInt("FAKE_CRASH_AFTER_MS"),
             ExitCode = EnvInt("FAKE_EXIT_CODE"),
             Hang = EnvFlag("FAKE_HANG"),
@@ -154,6 +179,18 @@ public sealed class FakeServerOptions
         if (!int.TryParse(raw, out var value))
             throw new ArgumentException($"{name} must be an integer, got '{raw}'");
         return value;
+    }
+
+    /// <summary>Same rule as <see cref="EnvInt"/>: a FAKE_BIND that does not parse is a mistake worth
+    /// hearing about, not a silent fall back to the default on an interface nobody asked for.</summary>
+    private static IPAddress? EnvAddress(string name)
+    {
+        var raw = Env(name);
+        if (raw is null)
+            return null;
+        if (!IPAddress.TryParse(raw, out var address))
+            throw new ArgumentException($"{name} must be an IP address, got '{raw}'");
+        return address;
     }
 
     private static bool EnvFlag(string name) =>

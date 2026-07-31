@@ -203,7 +203,9 @@ public static class SourceCommands
 
             output.Line($"{report.Name}: {report.Repo} @ {report.Ref}");
             output.Line($"  checkout   {report.Checkout}" +
-                        (report.Sha is null ? " (not cloned yet)" : $" at {report.Sha[..7]}"));
+                        (report.Sha is not null ? $" at {report.Sha[..7]}"
+                            : report.CheckedOut ? " (present, but HEAD is unreadable)"
+                            : " (not cloned yet)"));
             output.Line($"  target     {report.Preset} ({report.PlatformKey ?? "unmapped"})");
             output.Line($"  engine     {report.EngineVersion ?? "?"} " +
                         $"pinned by {report.EngineTag ?? "(no template tag)"}");

@@ -214,7 +214,11 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
             // place by failing first: a compile error here is a compiler diagnostic, and the same
             // error inside an export is buried in a Godot log that reports it as a failed export.
             log?.Report("dotnet build");
-            await RunAsync(dotnet, ["build", "-c", "Release"], checkout, log, ct);
+            var project = GameCheckout.GameProject(checkout);
+            string[] buildArgs = project is null
+                ? ["build", "-c", "Release"]
+                : ["build", Relative(checkout, project), "-c", "Release"];
+            await RunAsync(dotnet, buildArgs, checkout, log, ct);
 
             var exportPath = ExportPathFor(checkout, preset);
             Directory.CreateDirectory(Path.GetDirectoryName(exportPath)!);
@@ -344,8 +348,15 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
             };
         }
 
-        var sha = BuildTools.Capture(BuildTools.FindOnPath("git") ?? "git",
-            ["-C", checkout, "rev-parse", "HEAD"]).Trim();
+        var sha = ReadHeadSha(BuildTools.FindOnPath("git") ?? "git", checkout);
+
+        if (sha is null)
+            // There is a .git here and git still cannot name HEAD, which is what an interrupted clone
+            // leaves behind. Reporting ready would send the operator into a build that dies at the
+            // first `git fetch`.
+            problems.Add($"{checkout} has a .git directory but git cannot read HEAD there, so the " +
+                         $"clone is incomplete. `vortex source remove {spec.Name} --purge` deletes it " +
+                         "and the next build re-clones.");
 
         EnginePin? pin = null;
         TemplatePin? template = null;
@@ -389,7 +400,7 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
             Ref = spec.Ref,
             Checkout = checkout,
             CheckedOut = true,
-            Sha = string.IsNullOrEmpty(sha) ? null : sha,
+            Sha = sha,
             Preset = preset,
             PlatformKey = PlatformKeyForPreset(preset),
             EngineVersion = pin?.Version,
@@ -491,6 +502,19 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
         return Path.GetFullPath(Path.Combine(checkout, relative.Replace('/', Path.DirectorySeparatorChar)));
     }
 
+    /// <summary>HEAD's commit, or null if git could not name one.
+    ///
+    /// The shape is checked rather than trusted because BuildTools.Capture falls back to stderr when a
+    /// command writes nothing to stdout, so a half-cloned or unreadable checkout comes back as "fatal:
+    /// not a git repository" instead of empty. That string is longer than a sha7 and passes any length
+    /// test: `source status` printed "at fatal: " where the commit goes, and a build would have taken
+    /// its first seven characters as the version it staged under.</summary>
+    private static string? ReadHeadSha(string git, string checkout)
+    {
+        var output = BuildTools.Capture(git, ["-C", checkout, "rev-parse", "HEAD"]).Trim();
+        return output.Length >= 7 && output.All(Uri.IsHexDigit) ? output : null;
+    }
+
     private static async Task<string> FetchAsync(string git, SourceSpec spec, string checkout,
         IProgress<string>? log, CancellationToken ct)
     {
@@ -518,10 +542,9 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
         // A detached tag or sha has nothing to pull, and that is not a failure.
         await RunAsync(git, ["pull", "--ff-only"], checkout, log, ct, allowFailure: true);
 
-        var sha = BuildTools.Capture(git, ["-C", checkout, "rev-parse", "HEAD"]).Trim();
-        if (sha.Length < 7)
-            throw new SourceBuildException(SourceFailure.GitFailed,
-                $"could not read HEAD in {checkout} after checking out '{spec.Ref}'");
+        var sha = ReadHeadSha(git, checkout)
+                  ?? throw new SourceBuildException(SourceFailure.GitFailed,
+                      $"could not read HEAD in {checkout} after checking out '{spec.Ref}'");
 
         log?.Report($"at {sha[..7]}");
         return sha;

@@ -118,7 +118,7 @@ release beside the zips:
 
 ```
 <LocalApplicationData>/XonoticGodot/Launcher/
-  settings.json                 channel, install root override
+  settings.json                 channel, install root override, update + notification policy (§8)
   game/versions/<ver>/          one extracted install per version (current + N-1 for rollback)
   game/current.json             { version, layout: fat|core, platformKey, root }
   game/staging/                 download + extract scratch; deleted on success or next start
@@ -139,7 +139,54 @@ Launcher Velopack packages (`vpk pack` output) attach to the **same `v*` release
 zips — one release train, one version story, and `GithubSource` always finds its packages on the
 latest release. (Deferred until the launcher leaves prototype; the prototype runs unpackaged.)
 
-### 8. Repo layout: `launcher/` in-repo, with the two Godot-repo hazards handled
+### 8. Update policy: what happens without being asked, and what is asked
+
+§3 settled the *mechanism* for both updates and left the *policy* unstated, which in practice meant
+"check at startup, install on a button press, and restart the launcher whenever Velopack felt like
+it". Three policies now, each a setting, each with a default that has to survive the question "what
+does this do to someone who is about to play a match".
+
+**Game updates default to download-then-ask.** Downloading ahead of the press is what keeps
+invariant #1 honest — Play is only instant if the bytes arrived before Play was pressed — and asking
+before the swap is what keeps a new build from replacing the one a player is about to join a server
+with. The two halves are separable for free because invariant #2 already required them to be:
+verify-before-swap means the install does everything expensive out-of-tree and then renames, so
+`StageAsync` is just `InstallAsync` stopping before the `current.json` flip. Fully automatic and
+notify-only are both available; neither is the default because one surprises the player and the
+other makes them wait.
+
+A swap is refused while the game is running. It rewrites `current.json` and GCs old builds, and the
+running game is reading files out of one of them.
+
+**Launcher updates default to automatic and can be switched off.** Off is a hazard worth naming:
+`latest.json` is a cross-repo contract (§5), so a launcher far enough behind can lose the ability to
+read the feed and therefore to install the game at all. Off therefore still checks and still
+reports, because a launcher that has quietly stopped being able to do its job should say so.
+
+**The restart is gated, and the check no longer performs it.** `ApplyUpdatesAndRestart` terminates
+the process; calling it from a startup check — as the first implementation did — can throw away an
+in-flight install and looks to the player like a crash. Checking and applying are separate calls,
+and the restart requires that no install, no game, and no open sheet is in flight.
+
+**The channel applies to the launcher too.** The first implementation passed `prerelease: true`
+unconditionally, quietly serving prerelease launchers to stable-channel players. One channel, both
+artifacts.
+
+**Notification reach is asked, not defaulted.** In-app banner, native OS notification, or a
+tray-resident process that keeps checking with the window closed. This is the only preference here
+with no defensible default: the answer turns on whether the player wants a process of ours resident
+on their machine, and nothing on disk can infer that. Defaulting to the quietest reach would mean
+the feature silently does not work for anyone who does not already keep the launcher open;
+defaulting to the loudest would install a background process nobody agreed to. So it is the single
+question first run asks, and nothing notifies until it is answered.
+
+**Unknown settings never escalate.** Every mode string is normalized on load, and an unrecognised
+value reads as the shipped default — never as the more eager option, never as a promotion from
+"asked" to "resident". Same rule `ReleaseChannels.Normalize` already applied to the channel, for the
+same reason: a file written by a newer launcher, or edited by hand, must not be able to widen what
+this one does.
+
+### 9. Repo layout: `launcher/` in-repo, with the two Godot-repo hazards handled
 
 `launcher/XonoticGodot.Launcher` (app) + `launcher/XonoticGodot.Launcher.Tests` (xunit, matching
 the repo's test stack). In-repo because it shares the release train, CI, and review flow — a

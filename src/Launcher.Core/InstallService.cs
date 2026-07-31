@@ -1,15 +1,36 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Launcher.Core;
 
 /// <summary>What's installed right now — persisted as game/current.json. <see cref="Root"/> is
-/// the zip's internal top dir (the game dir is versions/&lt;Version&gt;/&lt;Root&gt;); a "core"
-/// <see cref="Layout"/> install launches with --data pointing into the shared asset store.</summary>
+/// the zip's internal top dir (the game dir is versions/&lt;<see cref="Dir"/>&gt;/&lt;Root&gt;); a
+/// "core" <see cref="Layout"/> install launches with --data pointing into the shared asset store.
+///
+/// <see cref="BuildId"/> and <see cref="DirName"/> are null in every marker written before source
+/// builds existed, and null means "the same as Version" because that is what a release build's id and
+/// directory name are. They exist because a source build breaks that identity: its id is
+/// `source:&lt;preset&gt;:&lt;ref&gt;@&lt;sha7&gt;`, its directory is a flattened form of that, and its
+/// version is the sha alone. A marker that recorded only the version pointed at versions/&lt;sha7&gt;,
+/// which does not exist, so pinning a source build wrote a file that resolved to nothing and the
+/// launcher reported nothing installed.</summary>
 public sealed record InstalledState(
-    string Version, string Layout, string PlatformKey, string Root, string? AssetsVersion)
+    string Version, string Layout, string PlatformKey, string Root, string? AssetsVersion,
+    string? BuildId = null, string? DirName = null)
 {
     public const string LayoutFat = "fat";
     public const string LayoutCore = "core";
+
+    // Both are derived views, not stored facts. Serializing them would put four fields in current.json
+    // where two are authoritative, and the next reader would have to work out which pair to trust.
+
+    /// <summary>The build-store id this marker pins, for comparing against <c>BuildRecord.Id</c>.</summary>
+    [JsonIgnore]
+    public string Id => BuildId ?? Version;
+
+    /// <summary>The directory under versions/ this marker points at.</summary>
+    [JsonIgnore]
+    public string Dir => DirName ?? Version;
 }
 
 /// <summary>Game-install lifecycle (ADR-0015 §3/§6): download → verify → extract to staging →
@@ -43,13 +64,31 @@ public sealed class InstallService(LauncherPaths paths, IDownloader downloader,
         }
     }
 
-    public string GameDirOf(InstalledState s) => Path.Combine(paths.VersionsDir, s.Version, s.Root);
+    public string GameDirOf(InstalledState s) => Path.Combine(paths.VersionsDir, s.Dir, s.Root);
 
     public string? AssetsDataDirOf(InstalledState s) => s.AssetsVersion is null
         ? null
         : Path.Combine(paths.AssetStoreDir, s.AssetsVersion, "assets", "data");
 
+    /// <summary>Download, verify, extract and flip — the whole thing, for callers that have already
+    /// decided (the CLI, and the UI's fully-automatic mode).</summary>
     public async Task<InstalledState> InstallAsync(ReleaseManifest manifest, string platformKey,
+        bool preferCore, IProgress<(string Phase, double Fraction)>? progress, CancellationToken ct) =>
+        Apply(await StageAsync(manifest, platformKey, preferCore, progress, ct));
+
+    /// <summary>Everything except going live: the new build ends up in versions/ beside the old one
+    /// and current.json still points at what the player has been playing.
+    ///
+    /// The split is what makes "download it now, switch when you say so" possible, and it is free
+    /// because the install was already built this way — the ADR-0015 invariant is verify-before-swap,
+    /// so all the expensive, failure-prone work (download, checksum, extract) already happened
+    /// out-of-tree with one <c>Directory.Move</c> between it and live. Staging just stops before the
+    /// three cheap lines that flip the marker.
+    ///
+    /// A staged build that is never applied is not lost disk: <c>BuildStore.List()</c> adopts
+    /// directories under versions/ with no entry in builds.json, so it shows up in
+    /// <c>vortex builds list</c> and is collectable like any other.</summary>
+    public async Task<InstalledState> StageAsync(ReleaseManifest manifest, string platformKey,
         bool preferCore, IProgress<(string Phase, double Fraction)>? progress, CancellationToken ct)
     {
         var plat = manifest.PlatformFor(platformKey)
@@ -100,12 +139,28 @@ public sealed class InstallService(LauncherPaths paths, IDownloader downloader,
         Directory.Move(extractDir, versionDir);
         File.Delete(zipPath);
 
-        var state = new InstalledState(manifest.Version, layout, platformKey, root, assetsVersion);
-        SaveCurrent(state);
-        Builds.Register(BuildRecord.ForRelease(state, DateTimeOffset.UtcNow));
-        Builds.Gc(protectedId: state.Version);
-        return state;
+        return new InstalledState(manifest.Version, layout, platformKey, root, assetsVersion);
     }
+
+    /// <summary>Make a staged build the one that launches. This is the only step in an install that
+    /// changes what pressing Play does, and it is three file operations — which is why it is safe to
+    /// hold back until the player agrees to it.
+    ///
+    /// Registering with the build store happens here rather than at stage time so that GC's
+    /// <c>protectedId</c> and the store's idea of the current build change together; a build the
+    /// player declined to switch to is still adopted by <c>BuildStore.List()</c> from its
+    /// directory.</summary>
+    public InstalledState Apply(InstalledState staged)
+    {
+        SaveCurrent(staged);
+        Builds.Register(BuildRecord.ForRelease(staged, DateTimeOffset.UtcNow));
+        Builds.Gc(protectedId: staged.Version);
+        return staged;
+    }
+
+    /// <summary>Whether a staged build is still on disk, for a launcher that staged it in an earlier
+    /// session and wants to offer the swap without re-downloading.</summary>
+    public bool IsStaged(InstalledState staged) => Directory.Exists(GameDirOf(staged));
 
     /// <summary>Ensure the content-addressed asset pack is in the shared store (core layout).
     /// Store hit = zero bytes downloaded — the whole point of the split payload (ADR-0015 §4).</summary>
@@ -141,8 +196,12 @@ public sealed class InstallService(LauncherPaths paths, IDownloader downloader,
             throw new InvalidOperationException(
                 $"build {build.Id} is recorded but its directory is gone; reinstall it");
 
+        // Id and DirName are carried across rather than derived from Version, because for a source
+        // build the three are different strings and only the version is ambiguous: two presets built
+        // from one sha share it.
         var state = new InstalledState(
-            build.Version, build.Layout, build.PlatformKey, build.Root, build.AssetsVersion);
+            build.Version, build.Layout, build.PlatformKey, build.Root, build.AssetsVersion,
+            build.Id, build.DirName);
         SaveCurrent(state);
         return state;
     }

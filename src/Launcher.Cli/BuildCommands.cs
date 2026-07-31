@@ -37,7 +37,9 @@ public static class BuildCommands
                 layout = b.Layout,
                 size_bytes = store.SizeOf(b),
                 installed_at = b.InstalledAt,
-                current = current is not null && current.Version == b.Version,
+                // On the id, not the version: a source build's version is a bare sha7 that two
+                // presets built from the same commit share, so comparing versions marks both.
+                current = current is not null && current.Id == b.Id,
             }).ToList();
 
             if (output.IsJson)
@@ -118,7 +120,7 @@ public static class BuildCommands
                 var all = store.List();
                 var survivors = new HashSet<string>(StringComparer.Ordinal);
                 if (current is not null)
-                    survivors.Add(current.Version);
+                    survivors.Add(current.Id);
                 foreach (var b in all.Where(b => !survivors.Contains(b.Id))
                              .Take(Math.Max(0, keepCount - survivors.Count)))
                     survivors.Add(b.Id);
@@ -128,7 +130,10 @@ public static class BuildCommands
                     doomed.Count == 0 ? "nothing to remove" : "would remove " + string.Join(", ", doomed));
             }
 
-            var removed = store.Gc(keepCount, current?.Version);
+            // Gc protects by id. Passing the version protected a release build by coincidence, since
+            // the two strings are equal there, and protected no source build at all - the pinned one
+            // included.
+            var removed = store.Gc(keepCount, current?.Id);
             return output.Ok(new { removed },
                 removed.Count == 0 ? "nothing to remove" : "removed " + string.Join(", ", removed));
         });

@@ -94,6 +94,93 @@ public sealed class InstallServiceTests : IDisposable
         Assert.DoesNotContain(_net.Downloads, u => u.Contains("assets"));
     }
 
+    [Fact]
+    public async Task Staging_downloads_the_new_build_without_changing_what_launches()
+    {
+        // The default update mode's whole premise: the bytes can be on disk long before the player
+        // agrees to switch, and until they do, Play must still start what it started yesterday.
+        await _installs.InstallAsync(MakeManifest("0.2.0", MakeFatZip("0.2.0")), PlatformKey.Windows,
+            preferCore: false, progress: null, CancellationToken.None);
+
+        var staged = await _installs.StageAsync(MakeManifest("0.3.0", MakeFatZip("0.3.0")),
+            PlatformKey.Windows, preferCore: false, progress: null, CancellationToken.None);
+
+        Assert.Equal("0.3.0", staged.Version);
+        Assert.True(_installs.IsStaged(staged));
+        Assert.True(Directory.Exists(Path.Combine(_paths.VersionsDir, "0.3.0")));
+        // The marker has not moved, so nothing about launching has changed.
+        Assert.Equal("0.2.0", _installs.LoadCurrent()!.Version);
+
+        var applied = _installs.Apply(staged);
+
+        Assert.Equal("0.3.0", applied.Version);
+        Assert.Equal("0.3.0", _installs.LoadCurrent()!.Version);
+        Assert.True(File.Exists(Path.Combine(_installs.GameDirOf(applied), "XonoticGodot.exe")));
+    }
+
+    [Fact]
+    public async Task A_staged_build_that_has_gone_missing_is_reported_rather_than_pinned()
+    {
+        // The launcher offers "switch now" from a staged build that may have been collected since,
+        // so the check has to be against the disk and not against the fact that we staged it.
+        var staged = await _installs.StageAsync(MakeManifest("0.3.0", MakeFatZip("0.3.0")),
+            PlatformKey.Windows, preferCore: false, progress: null, CancellationToken.None);
+        Directory.Delete(Path.Combine(_paths.VersionsDir, "0.3.0"), recursive: true);
+
+        Assert.False(_installs.IsStaged(staged));
+    }
+
+    [Fact]
+    public void Pin_resolves_a_build_whose_id_version_and_directory_all_differ()
+    {
+        // A release build's id, version and directory name are one string, and current.json recorded
+        // only the version because of it. A source build breaks that: the marker pointed at
+        // versions/<sha7>/, which does not exist, so pinning one exited 0 and left every reader
+        // downstream reporting nothing installed. This is the whole of `source build` that can be
+        // tested without a Godot editor and a multi-gigabyte checkout, so it is the part that is.
+        const string id = "source:windows-client:main@a1b2c3d";
+        var build = new BuildRecord
+        {
+            Id = id,
+            DirName = BuildRecord.SafeDirName(id),
+            Version = "a1b2c3d",
+            PlatformKey = PlatformKey.Windows,
+            Layout = InstalledState.LayoutFat,
+            Root = "windows-client",
+            Provider = BuildProviders.Source,
+            InstalledAt = DateTimeOffset.UtcNow,
+        };
+        Assert.NotEqual(build.Version, build.DirName);
+        Directory.CreateDirectory(Path.Combine(_paths.VersionsDir, build.DirName, build.Root));
+        _installs.Builds.Register(build);
+
+        var state = _installs.Pin(build);
+
+        Assert.Equal(id, state.Id);
+        Assert.Equal(build.DirName, state.Dir);
+        // LoadCurrent returns null when the directory the marker names is absent, so a round trip is
+        // the assertion that would have caught this.
+        Assert.Equal(state, _installs.LoadCurrent());
+    }
+
+    [Fact]
+    public void A_marker_written_before_source_builds_still_resolves()
+    {
+        // buildId and dirName are absent from every current.json already on disk, so null has to keep
+        // meaning "the same as version". If it stopped, upgrading the launcher would report the
+        // player's installed game as missing.
+        Directory.CreateDirectory(Path.Combine(_paths.VersionsDir, "0.4.0", "windows-client"));
+        Directory.CreateDirectory(_paths.GameDir);
+        File.WriteAllText(_paths.CurrentJsonPath,
+            """{"version":"0.4.0","layout":"fat","platformKey":"windows-x86_64","root":"windows-client"}""");
+
+        var state = _installs.LoadCurrent();
+
+        Assert.NotNull(state);
+        Assert.Equal("0.4.0", state!.Id);
+        Assert.Equal("0.4.0", state.Dir);
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────
 
     private ManifestFile MakeFatZip(string version) =>

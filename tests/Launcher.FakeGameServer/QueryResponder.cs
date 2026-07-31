@@ -256,9 +256,9 @@ public sealed class QueryResponder(FakeServer server, UdpClient socket)
         }
     }
 
-    /// <summary>Drop expired challenges, and cap the table. It binds 0.0.0.0 like the real server, so
-    /// a getchallenge flood is something it can be pointed at; unbounded growth would make the fixture
-    /// the thing that fell over.</summary>
+    /// <summary>Drop expired challenges, and cap the table. A getchallenge flood is something this can
+    /// be pointed at — from loopback by default, and from anywhere under <c>FAKE_BIND=0.0.0.0</c> —
+    /// and unbounded growth would make the fixture the thing that fell over.</summary>
     private void Prune()
     {
         var now = DateTimeOffset.UtcNow;
