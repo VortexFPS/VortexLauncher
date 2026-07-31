@@ -9,6 +9,15 @@ two-commit history. Both solutions build on net8.0 with no warnings. The A-serie
 identifiers are retired, and open work uses the EXT/LNCH/COND/TEST/DOCS scheme in the second half of
 this document.
 
+**One correction to that paragraph, kept rather than edited away, because the way it was wrong is worth
+knowing.** A8 was marked landed on the strength of `SourceProvider.cs` existing and compiling. Nothing
+called it: no CLI verb, no API route, no test. A milestone read as done from a class, and a class that
+nobody can invoke is not a feature however finished it looks. Worse, the two things it got wrong (the
+engine release tag, and looking for an editor in a release that publishes only templates) could not
+surface while it was unreachable, so "it compiles" had been standing in for "it works" for the whole of
+its life. Landed under LNCH-6 below, with both fixed. The lesson generalises past this entry: a
+milestone is done when something calls it, and the check is a caller, not a file.
+
 A follow-up batch has since landed LNCH-1, LNCH-2, COND-1, part of COND-2, and TEST-1. Those are marked
 **Landed** in place below rather than deleted, because the identifiers are cited in task lists and in
 other documents and a vanished ID reads as a lost requirement. None of that batch is committed yet: it
@@ -98,8 +107,8 @@ in `CommandDispatcher`.
 | Project | What it holds |
 |---|---|
 | `src/Launcher.Protocol` | Instance DTOs, command envelope, control modes and events, scopes, `ApiError`. BCL only, no project references, packable |
-| `src/Launcher.Core` | Release feeds with the GitHub API fallback, resumable sha256-verified download, install with atomic swap and N-1 rollback, the side-by-side build store, `GameControl` (srcon, getinfo, MD4, eventlog parsing), `Instances` (store, supervisor, content fetch, runner link), `SourceProvider`. BCL only |
-| `src/Launcher.Cli` | The `vortex` binary, which is also the runner daemon. `install`/`update`/`launch`, `builds list\|pin\|gc`, `server create\|list\|start\|stop\|restart\|delete\|console\|exec\|release`, `runner run\|status\|link\|unlink\|rotate-key\|install-service` |
+| `src/Launcher.Core` | Release feeds with the GitHub API fallback, resumable sha256-verified download, install with atomic swap and N-1 rollback, the side-by-side build store, `GameControl` (srcon, getinfo, MD4, eventlog parsing), `Instances` (store, supervisor, content fetch, runner link), and the source-build pipeline (`SourceProvider`, `GameCheckout`, `GodotToolchain`, `SourceStore`). BCL only |
+| `src/Launcher.Cli` | The `vortex` binary, which is also the runner daemon. `install`/`update`/`launch`, `builds list\|pin\|gc`, `source set\|list\|status\|build\|remove`, `server create\|list\|start\|stop\|restart\|delete\|console\|exec\|release`, `runner run\|status\|link\|unlink\|rotate-key\|install-service` |
 | `src/Launcher.WebServer` | The host owner's panel. Bearer auth on everything including the WebSocket upgrade, loopback binding by default, the runner link endpoint, proxy routes, live-console socket, `wwwroot/` |
 | `src/Launcher.Desktop` | The Avalonia player launcher, with Velopack for its own updates. Calls Core for feed, install and launch |
 | `tests/Launcher.Tests` | Eight files: checksum, manifest, install lifecycle, artifact naming, game control, runner, web server, architecture |
@@ -230,10 +239,34 @@ tail, exec and release, and there is no verb that changes an existing spec, so s
 a build means hand-editing `instance.json` or curling the API. Drain has the same problem from the other
 direction: the supervisor implements it and the runner API exposes it, and no subcommand reaches it.
 
-**LNCH-6. Give `SourceProvider` an entry point.** 351 lines that clone a repo, run the toolchain, and
-stage the result into the same build store downloaded releases land in, so pin and rollback behave
-identically for both. No CLI verb and no runner API route calls any of it, so it is currently
-unreachable code.
+**LNCH-6. Give `SourceProvider` an entry point. Landed, and it was not only an entry point.**
+`vortex source set|list|status|build|remove` are registered in `Program.cs` and a source build reaches
+the build store, where `builds pin` and `server create --build` treat it like a downloaded release.
+
+Adding the verbs exposed two design errors in the 351 lines they were meant to call, both of which
+would have produced a build that looked fine:
+
+- `ReadGodotPin` regexed `docs/RUNNING.md` for a version and asked for a release tagged
+  `engine-4.6.3`. The real tag is `engine-4.6.3-stable-vortex1`, so every source build would have
+  404'd. The pin now comes from `tools/engine-patches/engine.lock.json`, which is the file
+  `verify-engine-template.py` and the release workflow already check against. Prose drifts; a lockfile
+  is the thing CI trusts.
+- `EnsureToolchainAsync` searched that release for an EDITOR asset. The release carries three
+  `template_release` binaries and no editor at all, so it could not have worked with the right tag
+  either. That was a wrong model rather than a wrong string: the editor drives an export and may be
+  stock, while the TEMPLATE is what gets embedded in the shipped game and decides what engine players
+  run. The template is now fetched by the checkout's own `tools/data/fetch-engine-template.py` and the
+  editor comes from `--godot`, `$VORTEX_GODOT` or PATH, with no download and no silent fallback.
+
+The export is bracketed by `tools/verify-engine-template.py`, `--preset-config` before and
+`--patches --binary` after, so a source build cannot quietly ship a stock engine; that is the trap
+release.yml closed for CI and the launcher had no business reopening. Engine skew refuses and names
+both versions. Verified end to end on Windows against the real lockfile, template and scripts: the
+exported binary came back with `GetRawInputBuffer present (1x)`, so it carried the patched engine.
+
+Still open: no `runner-api-v1.yaml` operation and no panel screen, so this is CLI-only; no automated
+test, because the pipeline's inputs are a Godot editor and a multi-gigabyte checkout and the CI runner
+has neither; and no macOS run of the `.app` bundle path.
 
 **LNCH-7. Sign manifests with minisign.** ADR-0015 names this as the gate before launcher-managed
 installs become the default path. Until it exists, install integrity rests on sha256 values fetched from

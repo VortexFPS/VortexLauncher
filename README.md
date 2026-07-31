@@ -99,6 +99,9 @@ cannot touch the box and every operation goes to a runner over the protocol.
 | Install | `src/Launcher.Core/InstallService.cs` | staging extract → atomic move → `current.json` flip; keeps N-1 for rollback; shared content-addressed asset store for `-core` installs |
 | Extract | `src/Launcher.Core/ArchiveExtractor.cs` | `System.IO.Compression` on Windows/Linux; `ditto` on macOS, where the managed extractor drops the `.app`'s symlinks |
 | Launch | `src/Launcher.Core/GameLauncher.cs` | spawns the game; `--data <store>` for core installs (fat installs self-resolve) |
+| Source build | `src/Launcher.Core/SourceProvider.cs` | clone, export, verify, package, stage; `vortex source *` in `src/Launcher.Cli/SourceCommands.cs` |
+| Engine pin | `src/Launcher.Core/GameCheckout.cs` | reads `engine.lock.json` and `export_presets.cfg` out of a checkout, and names every game-repo script the build shells out to |
+| Toolchain | `src/Launcher.Core/GodotToolchain.cs` | finds git/dotnet/python/bash and the Godot editor, and refuses an editor that is not the pinned engine |
 | Artifact names | `src/Launcher.Core/LauncherConfig.cs` | the accepted release-artifact prefixes; see the rename note below |
 | Self-update | `src/Launcher.Desktop/SelfUpdateService.cs` | Velopack against this repo's releases |
 
@@ -135,12 +138,104 @@ not the other:
 What that costs is the exposition format, which is one frozen spec, three escaping rules and a number
 format, and a single-route HTTP listener bound to loopback.
 
+## Building the game from source
+
+```bash
+vortex source set game --repo https://github.com/VortexFPS/VortexArena.git --ref main
+vortex source status game        # can this box build it, and against which engine
+vortex source build game         # clone, export, verify, stage
+vortex builds pin source:linux-dedicated:main@a1b2c3d
+```
+
+`--repo` defaults to the game repo, so a plain `vortex source set game --ref main` works; the flag is
+there for forks. `--target` picks the export preset and defaults to `windows-client`, `macos-client`
+or `linux-dedicated` by OS, the last because a Linux box running `vortex` is usually a server. The
+result is an ordinary entry in the build store, so `builds list`, `builds pin`, `builds gc` and
+`server create --build` treat a compiled build exactly like a downloaded one.
+
+What the box has to have, all of it named in the refusal when it is absent: **git**, the **.NET SDK**,
+**Python 3**, **bash**, and a **Godot editor** of the version the checkout pins, mono/.NET build. On
+Windows the Git Bash that ships with git is used and the `bash` in `System32` is skipped, because that
+one is the WSL launcher and would run `package.sh` against `/mnt/c` inside a different filesystem.
+
+**Where the engine comes from is the part worth reading.** The Godot *editor* drives the export and can
+be a stock download; the export *template* is what gets embedded in the shipped game and therefore
+decides what engine players run. They are resolved differently on purpose:
+
+- The **template** comes from the checkout's own `tools/engine-patches/engine.lock.json` (the
+  authoritative pin, the file CI already trusts), fetched by the checkout's own
+  `tools/data/fetch-engine-template.py` and verified against the sha256 in that lockfile. The launcher
+  does not download it itself. A second downloader reading the same lockfile is how a project ends up
+  patched in CI and stock on a dev box, and nothing downstream notices.
+- The **editor** comes from `--godot`, then `$VORTEX_GODOT` or `$GODOT`, then PATH. There is no
+  download path: the game's release publishes three `template_release` binaries and no editor, so
+  there is nothing pinned to fetch, and guessing a godotengine.org URL would add an unpinned
+  acquisition path for the one input this whole mechanism exists to control. A missing editor fails
+  naming the version to install and the three ways to point at it. On Windows a `_console` twin beside
+  the binary is preferred, including when the operator names the GUI one, because the plain build
+  detaches from the terminal and `--version` comes back empty.
+
+Version skew refuses and names both versions. So does a stable-versus-prerelease channel mismatch, and
+so does a non-mono editor against a lockfile that sets `engine.dotnet`. There is no "try anyway"
+branch: a build against a mismatched engine compiles, exports, and then misbehaves at runtime on
+somebody else's machine.
+
+Two verification passes run, both through the game repo's own `tools/verify-engine-template.py`:
+`--preset-config` before the export, because it catches an emptied `custom_template/release` in
+seconds, and `--patches --binary` after it, because that is the only check that speaks to what
+shipped. Measured in the game repo (G10): an empty `custom_template/release` makes Godot export a
+complete, launchable binary from the *stock* template without failing. CI closed that trap; a source
+build that skipped these two would reopen it on every operator's box.
+
+Cross-OS exports are refused rather than attempted (ADR-0014): the lockfile already says which platform
+a preset builds for, so `--target linux-dedicated` on Windows costs one message instead of a
+twenty-minute export that could not have worked.
+
+The order of steps is the release workflow's order, deliberately: import, fetch template, verify the
+preset config, `dotnet build`, export, verify the binary, `tools/data/fetch-maps.py`, then
+`tools/package.sh --no-zip` to lay content beside the binary. `--skip-maps` drops the maps fetch, which
+leaves whatever the checkout already has; the fetch is otherwise cheap after the first run because it
+skips packs whose hash already matches. One step is not in release.yml: any NuGet package source in the
+checkout's `nuget.config` that points at a directory this box does not have is dropped before the
+restore, because the game's config adds the Godot editor's bundled `nupkgs` folder as an absolute path
+to one dev machine and NuGet hard-fails on a missing local source. CI removes that source by name; this
+generalises it. The edit is undone by the next build's `git checkout --force`.
+
+Verified end to end on Windows against the real `engine.lock.json`, `export_presets.cfg`, patched
+template and verify script: the exported binary came back with `GetRawInputBuffer present (1x)`, so it
+carried the patched engine, and the staged build showed up in `builds list` and took a `builds pin`.
+
+Exit codes: `4` something is not installed, `2` bad preset or wrong platform, `7` engine skew or a
+failed verification, `1` the build itself failed, `5` no such source. `--json` puts the same failure
+code in the envelope.
+
+Three things to know before relying on it:
+
+- **A macOS source build has never run.** The `.app` bundle path is written (`CopyTree` recreates
+  symlinks rather than dereferencing them, for the same reason `ArchiveExtractor` shells out to
+  `ditto`) and no Mac has executed it.
+- **`tools/package.sh --no-zip` exits 1 having done everything right**, because its last statement is
+  `$do_zip && info ...`. CI always zips, so nothing noticed. The launcher therefore asserts on the
+  output the way the release workflow asserts on the export's, and treats the exit code as advisory.
+  Worth fixing in the game repo.
+- **Nothing but the CLI reaches it.** There is no `runner-api-v1.yaml` operation and no panel screen,
+  so a source build cannot be driven from the WebServer or from Conductor.
+
 ## The contract with the game repo
 
-This repo builds and ships the launcher. It does **not** build the game, and the game does not
-reference it. The two meet at exactly one interface: **`latest.json`**, emitted by the game repo's
-release job (`tools/make-manifest.py`) and modelled here by `Core/Manifest.cs`. Changing the manifest
-shape is a cross-repo change and both sides have to land together.
+This repo builds and ships the launcher, and since `vortex source build` landed it can also build the
+game from a checkout. The game still does not reference it. Two interfaces run the other way:
+
+**`latest.json`**, emitted by the game repo's release job (`tools/make-manifest.py`) and modelled here
+by `Core/Manifest.cs`. Changing the manifest shape is a cross-repo change and both sides have to land
+together.
+
+**The game repo's build tooling**, consumed by `SourceProvider`: `tools/engine-patches/engine.lock.json`,
+`export_presets.cfg`, `tools/data/fetch-engine-template.py`, `tools/verify-engine-template.py`,
+`tools/data/fetch-maps.py` and `tools/package.sh`. Those are called rather than reimplemented, which
+makes them a contract: renaming one, or changing `engine.lock.json`'s shape, breaks source builds in
+this repo. `GameCheckout` is the single place that names them, and a checkout missing one fails saying
+which file and that the ref predates the tooling.
 
 Two consequences worth knowing before touching either side:
 

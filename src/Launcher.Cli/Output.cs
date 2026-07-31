@@ -17,7 +17,11 @@ public static class ExitCodes
     /// usually transient and never a reason to stop a player from launching what they have.</summary>
     public const int Unavailable = 3;
 
+    /// <summary>Something the verb needs is not on this box. The game, for the player verbs; a build
+    /// prerequisite (git, dotnet, python, bash, the Godot editor) for `source build` and `source
+    /// status`. Both mean "install something", which is why they share a code.</summary>
     public const int NotInstalled = 4;
+
     public const int NotFound = 5;
 
     /// <summary>The action is refused in the current state: an instance already running, a port in

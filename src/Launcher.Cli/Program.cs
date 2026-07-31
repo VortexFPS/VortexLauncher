@@ -25,6 +25,7 @@ root.Options.Add(dataRoot);
 
 PlayerCommands.Register(root, json, dataRoot);
 BuildCommands.Register(root, json, dataRoot);
+SourceCommands.Register(root, json, dataRoot);
 ServerCommands.Register(root, json, dataRoot);
 RunnerCommands.Register(root, json, dataRoot);
 

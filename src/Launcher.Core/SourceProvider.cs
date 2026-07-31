@@ -1,306 +1,669 @@
+using System.ComponentModel;
 using System.Diagnostics;
-using System.Text.RegularExpressions;
+using System.Xml;
+using System.Xml.Linq;
 
 namespace Launcher.Core;
+
+/// <summary>Failure codes a source build can report. They are part of the CLI's contract: `vortex
+/// source build --json` puts one in the envelope, and the exit code is derived from it, so a script
+/// can tell "install Godot" from "this ref does not build".</summary>
+public static class SourceFailure
+{
+    public const string GitMissing = "git_missing";
+    public const string DotnetMissing = "dotnet_missing";
+    public const string PythonMissing = "python_missing";
+    public const string BashMissing = "bash_missing";
+    public const string EditorMissing = "editor_missing";
+    public const string EditorUnusable = "editor_unusable";
+
+    /// <summary>The editor is not the engine the checkout pins. Always names both versions.</summary>
+    public const string EngineSkew = "engine_skew";
+
+    public const string CheckoutIncomplete = "checkout_incomplete";
+    public const string LockfileUnreadable = "lockfile_unreadable";
+
+    /// <summary>No such export preset, or one this box cannot build.</summary>
+    public const string PresetUnknown = "preset_unknown";
+    public const string CrossPlatform = "cross_platform";
+
+    public const string GitFailed = "git_failed";
+    public const string TemplateFetchFailed = "template_fetch_failed";
+    public const string ExportFailed = "export_failed";
+    public const string PackageFailed = "package_failed";
+
+    /// <summary>tools/verify-engine-template.py refused the build. Either the preset is not configured
+    /// to use the pinned template, or the exported binary does not carry it.</summary>
+    public const string VerificationFailed = "verification_failed";
+
+    public const string StepFailed = "step_failed";
+}
+
+public sealed class SourceBuildException(string code, string message) : Exception(message)
+{
+    public string Code { get; } = code;
+}
 
 /// <summary>Builds the game from a git checkout and stages the result in the same build store that
 /// downloaded releases land in, so pin, update and rollback behave identically for a compiled build
 /// and a downloaded one.
 ///
+/// The pipeline is deliberately the release workflow's pipeline, step for step:
+///
+///   fetch -> read the engine pin -> resolve and version-check the editor -> import ->
+///   fetch the pinned TEMPLATE -> verify the preset points at it -> dotnet build -> export ->
+///   verify the exported binary -> fetch maps -> package -> stage
+///
+/// Two of those steps are the whole reason this class is not shorter. The launcher fetches the
+/// template through the checkout's own tools/data/fetch-engine-template.py and verifies the result
+/// through its own tools/verify-engine-template.py, rather than reimplementing either. A second
+/// downloader reading the same lockfile is how a project ends up patched in CI and stock locally, and
+/// the verify step is the only assertion that speaks to what actually shipped: measured in the game
+/// repo, an empty custom_template/release makes Godot export a complete, launchable binary from the
+/// STOCK engine without failing. CI closed that trap; a source build that skipped these two would
+/// reopen it on every operator's box.
+///
 /// Every step streams as a job an operator can watch, because this takes long enough that a silent
 /// pipeline is indistinguishable from a hung one.</summary>
-public sealed partial class SourceProvider(LauncherPaths paths, BuildStore builds)
+public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
 {
     public string WorkDir => Path.Combine(paths.Root, "source");
-    public string ToolchainDir => Path.Combine(paths.Root, "toolchain");
 
-    public sealed record Request
+    /// <summary>Checkouts are keyed on the SOURCE NAME, not the repo's basename. Two sources pointing
+    /// at different forks of VortexArena would otherwise share one working tree and thrash it back and
+    /// forth on every build, which reads as a mysteriously slow clone.</summary>
+    public string CheckoutFor(string name) =>
+        Path.Combine(WorkDir, "checkouts", SourceStore.ValidateName(name));
+
+    /// <summary>Delete a checkout and everything under it.
+    ///
+    /// Read-only attributes are cleared first because git marks the loose objects under .git/objects
+    /// read-only, and Directory.Delete refuses those on Windows. Without this pass, deleting a
+    /// checkout fails on every checkout there is, which is the only kind this method is ever given.</summary>
+    public void DeleteCheckout(string name)
     {
-        public string Repo { get; init; } = $"https://github.com/{LauncherConfig.Repo}.git";
-        public string Ref { get; init; } = "main";
+        var dir = CheckoutFor(name);
+        if (!Directory.Exists(dir))
+            return;
 
-        /// <summary>Export preset to build. A runner builds only for its own platform: cross-OS Godot
-        /// exports are unreliable (ADR-0014), and an export that silently produces a broken binary is
-        /// worse than one that refuses.</summary>
-        public string Target { get; init; } = "linux-dedicated";
+        foreach (var file in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+        {
+            try
+            {
+                File.SetAttributes(file, FileAttributes.Normal);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
 
-        /// <summary>Reuse an existing data payload instead of downloading one. The usual answer on a
-        /// box that already has an install.</summary>
-        public string? LocalDataDir { get; init; }
+        Directory.Delete(dir, recursive: true);
     }
 
-    public sealed record Result(bool Ok, string? BuildId, string? Error);
+    public sealed record Result
+    {
+        public required bool Ok { get; init; }
+        public string? BuildId { get; init; }
+        public string? Code { get; init; }
+        public string? Error { get; init; }
+        public string? Sha { get; init; }
+        public string? Preset { get; init; }
+        public string? PlatformKey { get; init; }
+        public string? EngineVersion { get; init; }
+        public string? EngineTag { get; init; }
+        public string? EditorPath { get; init; }
+        public string? EditorVersion { get; init; }
+        public string? Dir { get; init; }
+    }
 
-    public async Task<Result> BuildAsync(Request request, IProgress<string>? log,
+    /// <summary>One prerequisite, as `source status` reports it.</summary>
+    public sealed record ToolReport(string Name, bool Ok, string? Path, string? Problem);
+
+    public sealed record Preflight
+    {
+        public required string Name { get; init; }
+        public required string Repo { get; init; }
+        public required string Ref { get; init; }
+        public required string Checkout { get; init; }
+        public bool CheckedOut { get; init; }
+        public string? Sha { get; init; }
+        public required string Preset { get; init; }
+        public string? PlatformKey { get; init; }
+        public string? EngineVersion { get; init; }
+        public string? EngineTag { get; init; }
+        public string? TemplateFile { get; init; }
+        public bool TemplatePresent { get; init; }
+        public required IReadOnlyList<ToolReport> Tools { get; init; }
+        public required IReadOnlyList<string> Problems { get; init; }
+        public bool Ready => Problems.Count == 0;
+        public string? LastBuildId { get; init; }
+        public DateTimeOffset? LastBuiltAt { get; init; }
+    }
+
+    /// <summary>The preset a build targets when the operator names none.
+    ///
+    /// Linux defaults to the dedicated server rather than the client: the CLI is what a host operator
+    /// installs on a headless box, and that box wants a server. `--target linux-client` is one flag
+    /// away for the other case.</summary>
+    public static string DefaultPreset() =>
+        OperatingSystem.IsWindows() ? "windows-client"
+        : OperatingSystem.IsMacOS() ? "macos-client"
+        : "linux-dedicated";
+
+    /// <summary>Export preset to manifest platform key, inverted from the table the release feed
+    /// already uses so a preset cannot come to mean two different things in one process.</summary>
+    public static string? PlatformKeyForPreset(string preset)
+    {
+        foreach (var (key, root) in PlatformKey.ZipSuffixMap.Values)
+            if (string.Equals(root, preset, StringComparison.Ordinal))
+                return key;
+        return null;
+    }
+
+    public async Task<Result> BuildAsync(SourceSpec spec, bool fetchMaps, IProgress<string>? log,
         CancellationToken ct = default)
     {
-        Directory.CreateDirectory(WorkDir);
-        var checkout = Path.Combine(WorkDir, SafeSegment(request.Repo));
-
         try
         {
-            var sha = await FetchAsync(request, checkout, log, ct);
-            var godot = await EnsureToolchainAsync(checkout, log, ct);
+            var checkout = CheckoutFor(spec.Name);
+            var git = BuildTools.RequireOnPath("git", SourceFailure.GitMissing,
+                "Install git from https://git-scm.com/downloads.");
+            var dotnet = BuildTools.RequireOnPath("dotnet", SourceFailure.DotnetMissing,
+                "Install the .NET SDK from https://dotnet.microsoft.com/download.");
 
+            var sha = await FetchAsync(git, spec, checkout, log, ct);
+
+            var pin = EnginePin.Read(checkout);
+            var preset = spec.Target ?? DefaultPreset();
+            var template = ResolveTemplate(pin, preset, checkout);
+            var platformKey = PlatformKeyForPreset(preset)!;
+
+            var editor = GodotEditor.Resolve(spec.GodotPath);
+            editor.RequireMatches(pin, GameCheckout.EngineLockPath(checkout));
+            log?.Report($"godot {editor.RawVersion} at {editor.Path}");
+
+            var python = BuildTools.ResolvePython();
+            var bash = BuildTools.ResolveBash();
+
+            await RepairNuGetSourcesAsync(checkout, dotnet, log, ct);
+
+            // Godot writes its import cache on first open. Non-fatal on purpose: a headless import
+            // reports missing-dependency warnings as a non-zero exit on a tree that exports fine, and
+            // the release workflow makes the same call for the same reason.
+            log?.Report("importing resources");
+            await RunAsync(editor.Path, ["--headless", "--path", checkout, "--import"],
+                checkout, log, ct, allowFailure: true);
+
+            log?.Report($"fetching the pinned {template.Platform} export template " +
+                        $"({pin.TemplateTag ?? "untagged"})");
+            await RunAsync(python,
+                [Script(checkout, GameCheckout.FetchTemplateScript(checkout),
+                        "tools/data/fetch-engine-template.py"),
+                    "--only", template.Platform],
+                checkout, log, ct, failureCode: SourceFailure.TemplateFetchFailed);
+
+            // Before the export, not after: this catches an emptied custom_template/release in
+            // seconds, and that is G10's actual cause. Godot does not fail on an empty field, it
+            // silently falls back to the stock template.
+            log?.Report($"verifying {preset} is configured to use the pinned template");
+            await RunAsync(python,
+                [Script(checkout, GameCheckout.VerifyTemplateScript(checkout),
+                        "tools/verify-engine-template.py"),
+                    "--preset-config", preset],
+                checkout, log, ct, failureCode: SourceFailure.VerificationFailed);
+
+            // The export builds the C# project itself, so this is not strictly required. It earns its
+            // place by failing first: a compile error here is a compiler diagnostic, and the same
+            // error inside an export is buried in a Godot log that reports it as a failed export.
             log?.Report("dotnet build");
-            await RunAsync("dotnet", ["build", "-c", "Release"], checkout, log, ct);
+            await RunAsync(dotnet, ["build", "-c", "Release"], checkout, log, ct);
 
-            log?.Report($"godot export {request.Target}");
-            await RunAsync(godot,
-                ["--headless", "--path", checkout, "--export-release", request.Target,
-                    Path.Combine(checkout, "dist", request.Target, "game")],
-                checkout, log, ct);
+            var exportPath = ExportPathFor(checkout, preset);
+            Directory.CreateDirectory(Path.GetDirectoryName(exportPath)!);
 
-            var buildId = $"source:{request.Ref}@{sha[..7]}";
-            var staged = Stage(checkout, request, buildId, sha);
+            log?.Report($"exporting {preset}");
+            // Godot's headless export exits non-zero on benign warnings, so the assertion is that the
+            // output appeared rather than the exit code. release.yml does exactly this.
+            await RunAsync(editor.Path,
+                ["--headless", "--path", checkout, "--export-release", preset, exportPath],
+                checkout, log, ct, allowFailure: true);
+
+            if (!File.Exists(exportPath) && !Directory.Exists(exportPath))
+                throw new SourceBuildException(SourceFailure.ExportFailed,
+                    $"the export produced nothing at {exportPath}. Godot's headless export exits " +
+                    "non-zero on warnings, so the real failure is above this line in the streamed log.");
+
+            // The only check that speaks to what shipped. --patches re-hashes the patch files too, so
+            // a silently edited patch fails here as well.
+            log?.Report("verifying the exported binary carries the pinned engine");
+            await RunAsync(python,
+                [Script(checkout, GameCheckout.VerifyTemplateScript(checkout),
+                        "tools/verify-engine-template.py"), "--patches",
+                    "--binary", Relative(checkout, exportPath), "--preset", preset],
+                checkout, log, ct, failureCode: SourceFailure.VerificationFailed);
+
+            if (fetchMaps)
+            {
+                log?.Report("fetching compiled maps");
+                await RunAsync(python,
+                    [Script(checkout, GameCheckout.FetchMapsScript(checkout),
+                        "tools/data/fetch-maps.py")],
+                    checkout, log, ct);
+            }
+
+            // package.sh lays content, licences and the launch script beside the binary, which is what
+            // turns an export into something that runs. Called rather than reimplemented for the same
+            // reason as the template fetch, and with a sharper edge: macOS puts data INSIDE the
+            // bundle, and a launcher-local copy of that rule would be wrong on exactly one platform.
+            //
+            // Its exit code is not the assertion, for a specific reason: the script's last statement
+            // is `$do_zip && info ...`, so under --no-zip it returns 1 having done everything right.
+            // Nothing noticed because CI always zips. So this asserts on the output the way the
+            // release workflow asserts on the export's, which is the stronger check anyway.
+            log?.Report("packaging");
+            await RunAsync(bash,
+                [Script(checkout, GameCheckout.PackageScript(checkout), "tools/package.sh"),
+                    "--no-zip", "--version", sha[..7], preset],
+                checkout, log, ct, allowFailure: true);
+
+            RequirePackaged(checkout, preset, exportPath);
+
+            var buildId = BuildIdFor(spec.Ref, preset, sha);
+            var dir = Stage(checkout, preset, buildId, sha, platformKey);
             log?.Report($"staged {buildId}");
-            return new Result(true, staged, null);
+
+            return new Result
+            {
+                Ok = true,
+                BuildId = buildId,
+                Sha = sha,
+                Preset = preset,
+                PlatformKey = platformKey,
+                EngineVersion = pin.Version,
+                EngineTag = pin.TemplateTag,
+                EditorPath = editor.Path,
+                EditorVersion = editor.RawVersion,
+                Dir = dir,
+            };
         }
-        catch (Exception ex) when (ex is InvalidOperationException or IOException)
+        catch (SourceBuildException ex)
         {
-            return new Result(false, null, ex.Message);
+            return new Result { Ok = false, Code = ex.Code, Error = ex.Message };
+        }
+        catch (IOException ex)
+        {
+            return new Result { Ok = false, Code = SourceFailure.StepFailed, Error = ex.Message };
         }
     }
 
-    private async Task<string> FetchAsync(Request request, string checkout, IProgress<string>? log,
-        CancellationToken ct)
+    /// <summary>Answer "would a build work here, and against which engine", without building.
+    ///
+    /// Collects every problem rather than stopping at the first, because the answer an operator wants
+    /// is the whole list of things to install, not one of them per five-minute round trip.</summary>
+    public Preflight Inspect(SourceSpec spec)
     {
+        var checkout = CheckoutFor(spec.Name);
+        var problems = new List<string>();
+        var tools = new List<ToolReport>();
+
+        foreach (var (name, resolve) in new (string, Func<string>)[]
+                 {
+                     ("git", () => BuildTools.RequireOnPath("git", SourceFailure.GitMissing,
+                         "Install git from https://git-scm.com/downloads.")),
+                     ("dotnet", () => BuildTools.RequireOnPath("dotnet", SourceFailure.DotnetMissing,
+                         "Install the .NET SDK from https://dotnet.microsoft.com/download.")),
+                     ("python", BuildTools.ResolvePython),
+                     ("bash", BuildTools.ResolveBash),
+                 })
+        {
+            try
+            {
+                tools.Add(new ToolReport(name, true, resolve(), null));
+            }
+            catch (SourceBuildException ex)
+            {
+                tools.Add(new ToolReport(name, false, null, ex.Message));
+                problems.Add(ex.Message);
+            }
+        }
+
+        var preset = spec.Target ?? DefaultPreset();
+        var checkedOut = Directory.Exists(Path.Combine(checkout, ".git"));
+
+        if (!checkedOut)
+        {
+            // Everything below is read out of the checkout, so with none there the honest answer is
+            // "unknown", not "fine". Reporting a clean bill here would be the same mistake
+            // verify-engine-template.py refuses to make.
+            problems.Add($"no checkout at {checkout}; `vortex source build {spec.Name}` clones it, and " +
+                         "the engine pin cannot be read until it exists");
+            return new Preflight
+            {
+                Name = spec.Name, Repo = spec.Repo, Ref = spec.Ref, Checkout = checkout,
+                CheckedOut = false, Preset = preset, PlatformKey = PlatformKeyForPreset(preset),
+                Tools = tools, Problems = problems,
+                LastBuildId = spec.LastBuildId, LastBuiltAt = spec.LastBuiltAt,
+            };
+        }
+
+        var sha = BuildTools.Capture(BuildTools.FindOnPath("git") ?? "git",
+            ["-C", checkout, "rev-parse", "HEAD"]).Trim();
+
+        EnginePin? pin = null;
+        TemplatePin? template = null;
+        try
+        {
+            pin = EnginePin.Read(checkout);
+            template = ResolveTemplate(pin, preset, checkout);
+        }
+        catch (SourceBuildException ex)
+        {
+            problems.Add(ex.Message);
+        }
+
+        if (pin is not null)
+        {
+            try
+            {
+                var editor = GodotEditor.Resolve(spec.GodotPath);
+                editor.RequireMatches(pin, GameCheckout.EngineLockPath(checkout));
+                tools.Add(new ToolReport("godot", true, $"{editor.Path} ({editor.RawVersion})", null));
+            }
+            catch (SourceBuildException ex)
+            {
+                tools.Add(new ToolReport("godot", false, null, ex.Message));
+                problems.Add(ex.Message);
+            }
+        }
+
+        // Present is not the same as verified: the build re-checks the sha256 through
+        // fetch-engine-template.py, which is the tool that owns that answer. Size is the cheap tell.
+        var templatePath = template is null
+            ? null
+            : Path.Combine(GameCheckout.TemplateDir(checkout), template.FileName);
+        var templatePresent = templatePath is not null && File.Exists(templatePath) &&
+                              (template!.Bytes == 0 || new FileInfo(templatePath).Length == template.Bytes);
+
+        return new Preflight
+        {
+            Name = spec.Name,
+            Repo = spec.Repo,
+            Ref = spec.Ref,
+            Checkout = checkout,
+            CheckedOut = true,
+            Sha = string.IsNullOrEmpty(sha) ? null : sha,
+            Preset = preset,
+            PlatformKey = PlatformKeyForPreset(preset),
+            EngineVersion = pin?.Version,
+            EngineTag = pin?.TemplateTag,
+            TemplateFile = template?.FileName,
+            TemplatePresent = templatePresent,
+            Tools = tools,
+            Problems = problems,
+            LastBuildId = spec.LastBuildId,
+            LastBuiltAt = spec.LastBuiltAt,
+        };
+    }
+
+    /// <summary>The build store's id for a source build.
+    ///
+    /// The plan writes this as `source:{ref}@{sha}`; the preset is in it because four presets now
+    /// exist and two of them build on the same OS. Without it, building linux-client and then
+    /// linux-dedicated from one ref would have the second silently replace the first under an id that
+    /// no longer describes it.</summary>
+    public static string BuildIdFor(string reference, string preset, string sha) =>
+        $"source:{preset}:{reference}@{sha[..Math.Min(7, sha.Length)]}";
+
+    private static TemplatePin ResolveTemplate(EnginePin pin, string preset, string checkout)
+    {
+        var template = pin.TemplateForPreset(preset);
+
+        if (template is null)
+        {
+            var known = ExportPresets.Read(checkout).Keys.OrderBy(k => k, StringComparer.Ordinal);
+            throw new SourceBuildException(SourceFailure.PresetUnknown,
+                $"{GameCheckout.EngineLockPath(checkout)} pins no engine template for preset " +
+                $"'{preset}'. Pinned presets: {string.Join(", ", pin.KnownPresets)}. " +
+                $"export_presets.cfg defines: {string.Join(", ", known)}. A preset with no pinned " +
+                "template would export against whatever stock template this box happens to have, so " +
+                "the launcher refuses rather than guessing.");
+        }
+
+        // ADR-0014: cross-OS Godot exports are unreliable, and one that silently produces a broken
+        // binary is worse than one that refuses. The lockfile already names the platform, so this
+        // costs nothing to check and saves a 20-minute export that could not have worked.
+        var here = OperatingSystem.IsWindows() ? "windows"
+            : OperatingSystem.IsMacOS() ? "macos"
+            : "linux";
+
+        if (!string.Equals(template.Platform, here, StringComparison.Ordinal))
+            throw new SourceBuildException(SourceFailure.CrossPlatform,
+                $"preset '{preset}' builds for {template.Platform} and this box is {here}. A runner " +
+                "builds only for its own platform (ADR-0014): cross-OS Godot exports are unreliable " +
+                "and fail by producing a broken binary rather than by refusing. Build this preset on " +
+                $"a {template.Platform} box.");
+
+        if (PlatformKeyForPreset(preset) is null)
+            throw new SourceBuildException(SourceFailure.PresetUnknown,
+                $"preset '{preset}' has no manifest platform key in PlatformKey.ZipSuffixMap, so a " +
+                "build from it could not be staged where an instance would find it. Add it there " +
+                "alongside the release-artifact naming it already describes.");
+
+        return template;
+    }
+
+    /// <summary>Assert the export directory is a layout a player could run, rather than a bare binary.
+    ///
+    /// The content directory is derived from the artifact's own shape rather than from the preset
+    /// name: a .app is a bundle and its data goes inside it, anything else gets data beside it. Keying
+    /// on "macos-client" would be a second copy of package.sh's rule, and the copy is what goes stale.
+    /// A staged build missing its content starts and then finds no maps, which reads as a broken game
+    /// rather than an incomplete build.</summary>
+    private static void RequirePackaged(string checkout, string preset, string exportPath)
+    {
+        var bundle = exportPath.EndsWith(".app", StringComparison.OrdinalIgnoreCase);
+        var content = bundle
+            ? Path.Combine(exportPath, "Contents", "Resources", "data")
+            : Path.Combine(GameCheckout.DistDir(checkout, preset), "data");
+
+        if (!File.Exists(exportPath) && !Directory.Exists(exportPath))
+            throw new SourceBuildException(SourceFailure.PackageFailed,
+                $"packaging removed or never produced {exportPath}");
+
+        if (!Directory.Exists(content) || !Directory.EnumerateFileSystemEntries(content).Any())
+            throw new SourceBuildException(SourceFailure.PackageFailed,
+                $"tools/package.sh left no game content at {content}, so this build would start and " +
+                "find nothing to load. Its output is above; the usual cause is an empty data/ in the " +
+                "checkout, which `python tools/data/fetch-maps.py` fills for maps and which is " +
+                "otherwise committed.");
+    }
+
+    private static string ExportPathFor(string checkout, string preset)
+    {
+        var presets = ExportPresets.Read(checkout);
+        if (!presets.TryGetValue(preset, out var configured) || configured.Length == 0)
+            throw new SourceBuildException(SourceFailure.PresetUnknown,
+                $"export_presets.cfg has no preset '{preset}' with an export_path. Defined: " +
+                $"{string.Join(", ", presets.Keys.OrderBy(k => k, StringComparer.Ordinal))}");
+
+        var relative = configured.StartsWith("res://", StringComparison.Ordinal)
+            ? configured["res://".Length..]
+            : configured;
+
+        return Path.GetFullPath(Path.Combine(checkout, relative.Replace('/', Path.DirectorySeparatorChar)));
+    }
+
+    private static async Task<string> FetchAsync(string git, SourceSpec spec, string checkout,
+        IProgress<string>? log, CancellationToken ct)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(checkout)!);
+
         if (!Directory.Exists(Path.Combine(checkout, ".git")))
         {
-            log?.Report($"cloning {request.Repo}");
+            log?.Report($"cloning {spec.Repo}");
             // Blobless: the history is needed to check out a ref, the historical file contents are
             // not, and this repo's assets make a full clone many gigabytes.
-            await RunAsync("git",
-                ["clone", "--filter=blob:none", request.Repo, checkout], WorkDir, log, ct);
+            await RunAsync(git, ["clone", "--filter=blob:none", spec.Repo, checkout],
+                Path.GetDirectoryName(checkout)!, log, ct, failureCode: SourceFailure.GitFailed);
         }
         else
         {
             log?.Report("fetching");
-            await RunAsync("git", ["fetch", "--all", "--prune"], checkout, log, ct);
+            await RunAsync(git, ["fetch", "--all", "--prune"], checkout, log, ct,
+                failureCode: SourceFailure.GitFailed);
         }
 
-        await RunAsync("git", ["checkout", "--force", request.Ref], checkout, log, ct);
+        // --force also discards the nuget.config edit RepairNuGetSourcesAsync may have made last
+        // build, which is what keeps that edit from accumulating or drifting.
+        await RunAsync(git, ["checkout", "--force", spec.Ref], checkout, log, ct,
+            failureCode: SourceFailure.GitFailed);
         // A detached tag or sha has nothing to pull, and that is not a failure.
-        await RunAsync("git", ["pull", "--ff-only"], checkout, log, ct, allowFailure: true);
+        await RunAsync(git, ["pull", "--ff-only"], checkout, log, ct, allowFailure: true);
 
-        var sha = (await CaptureAsync("git", ["rev-parse", "HEAD"], checkout, ct)).Trim();
+        var sha = BuildTools.Capture(git, ["-C", checkout, "rev-parse", "HEAD"]).Trim();
+        if (sha.Length < 7)
+            throw new SourceBuildException(SourceFailure.GitFailed,
+                $"could not read HEAD in {checkout} after checking out '{spec.Ref}'");
+
         log?.Report($"at {sha[..7]}");
         return sha;
     }
 
-    /// <summary>Make sure the pinned Godot console binary and export templates are cached.
+    /// <summary>Drop package sources that point at a directory this box does not have.
     ///
-    /// The version comes from the checkout's own docs/RUNNING.md pin, never a constant here. A
-    /// launcher that hardcoded it would build the wrong engine the first time the game moved, and the
-    /// symptom would be a successful build that crashes on load.</summary>
-    private async Task<string> EnsureToolchainAsync(string checkout, IProgress<string>? log,
-        CancellationToken ct)
+    /// The game's nuget.config adds the Godot editor's bundled nupkgs folder as a local source, which
+    /// is an absolute path to one dev machine. NuGet hard-fails on a missing local source, so without
+    /// this every source build fails at restore on every box that is not that machine - including all
+    /// of Linux, which is where the dedicated-server preset is built. The release workflow solves it
+    /// the same way, by name; this generalises to any dev-local source because the failure is the
+    /// same whatever the key is called.
+    ///
+    /// The edit is transient: the next build's `git checkout --force` restores the file.</summary>
+    private static async Task RepairNuGetSourcesAsync(string checkout, string dotnet,
+        IProgress<string>? log, CancellationToken ct)
     {
-        var pin = ReadGodotPin(checkout)
-            ?? throw new InvalidOperationException(
-                "could not read the Godot version pin from docs/RUNNING.md; refusing to guess");
+        var config = GameCheckout.NuGetConfigPath(checkout);
+        if (!File.Exists(config))
+            return;
 
-        var versionDir = Path.Combine(ToolchainDir, pin);
-
-        if (FindGodotBinary(versionDir) is { } cached)
+        XDocument document;
+        try
         {
-            log?.Report($"toolchain {pin} cached");
-            return cached;
+            document = XDocument.Load(config);
+        }
+        catch (XmlException)
+        {
+            return; // a malformed nuget.config is the restore's failure to report, not this method's
         }
 
-        // The engine is a custom build published on the game repo's own releases as engine-<pin>, not
-        // a stock godotengine.org download. Fetching it from anywhere else would produce a build
-        // against the wrong engine, which compiles and then misbehaves at runtime.
-        log?.Report($"fetching Godot {pin}");
-        await DownloadToolchainAsync(pin, versionDir, log, ct);
-
-        return FindGodotBinary(versionDir)
-               ?? throw new InvalidOperationException(
-                   $"the engine-{pin} release did not contain a Godot binary for {PlatformKey.Current}. " +
-                   "Install one into " + versionDir + " by hand, or fix the release. Version skew " +
-                   "fails here deliberately rather than producing a build that looks fine and is not.");
-    }
-
-    /// <summary>Download and extract the pinned engine, plus its export templates.
-    ///
-    /// Both are cached per pinned version and shared across builds and branches: templates run about a
-    /// gigabyte per ADR-0014, and re-downloading them for every branch switch would make source builds
-    /// unusable on a metered connection.</summary>
-    private async Task DownloadToolchainAsync(string pin, string versionDir, IProgress<string>? log,
-        CancellationToken ct)
-    {
-        using var http = LauncherHttp.Create(TimeSpan.FromMinutes(10));
-        var tag = "engine-" + pin;
-        var url = $"https://api.github.com/repos/{LauncherConfig.Repo}/releases/tags/{tag}";
-
-        var json = await http.GetStringAsync(url, ct);
-        var release = System.Text.Json.JsonSerializer.Deserialize<GitHubApiFeed.ApiRelease>(
-                          json, ReleaseManifest.JsonOptions)
-                      ?? throw new InvalidOperationException($"release {tag} not found");
-
-        var editor = PickAsset(release, EditorAssetHints());
-        var templates = PickAsset(release, ["export_templates", "export-templates", ".tpz"]);
-
-        if (editor is null)
-            throw new InvalidOperationException(
-                $"release {tag} has no editor asset for {PlatformKey.Current}; " +
-                $"it carries: {string.Join(", ", release.Assets.Select(a => a.Name))}");
-
-        Directory.CreateDirectory(versionDir);
-        var downloader = new DownloadService(http);
-
-        await FetchAndExtractAsync(downloader, editor, versionDir, log, ct);
-
-        if (templates is not null)
-            await FetchAndExtractAsync(downloader, templates,
-                Path.Combine(versionDir, "templates"), log, ct);
-        else
-            log?.Report(
-                $"warning: {tag} carries no export templates; a client export will fail, though a " +
-                "headless dedicated build may not need them");
-    }
-
-    private async Task FetchAndExtractAsync(DownloadService downloader,
-        GitHubApiFeed.ApiAsset asset, string destination, IProgress<string>? log, CancellationToken ct)
-    {
-        var staging = Path.Combine(ToolchainDir, "staging");
-        Directory.CreateDirectory(staging);
-        var archive = Path.Combine(staging, asset.Name);
-
-        // The digest is what makes this safe to cache and reuse. An asset with none is refused rather
-        // than trusted, on the same rule the game installer already follows.
-        var sha = asset.Digest?.StartsWith("sha256:", StringComparison.Ordinal) == true
-            ? asset.Digest["sha256:".Length..].ToLowerInvariant()
-            : throw new InvalidOperationException(
-                $"{asset.Name} has no published sha256; refusing an unverifiable toolchain download");
-
-        log?.Report($"downloading {asset.Name} ({asset.Size / (1 << 20)} MB)");
-        await downloader.DownloadAsync(asset.BrowserDownloadUrl, archive, asset.Size, sha,
-            new Progress<double>(f => log?.Report($"  {f:P0}")), ct);
-
-        log?.Report($"extracting {asset.Name}");
-        Directory.CreateDirectory(destination);
-
-        // Through the same seam the game install uses, and for the same reason: on macOS the Godot
-        // editor is an .app bundle whose Frameworks directory is symlinks, and the managed extractor
-        // drops them silently. That produced an editor that looked installed and would not launch.
-        // Easy to miss here because this path is developer-only, so the failure lands on whoever
-        // first tries a source build on a Mac rather than on a player.
-        await ArchiveExtractor.ForCurrentPlatform().ExtractAsync(archive, destination, ct);
-
-        File.Delete(archive);
-
-        if (!OperatingSystem.IsWindows())
-            MarkExecutables(destination);
-    }
-
-    /// <summary>Zip extraction does not restore the +x bit, so a freshly extracted Godot will not
-    /// run on Linux or macOS without this.</summary>
-    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")] // callers guard on IsWindows()
-    private static void MarkExecutables(string directory)
-    {
-        foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+        foreach (var source in document.Descendants("packageSources").Elements("add").ToList())
         {
-            var name = Path.GetFileName(file);
-            if (!name.Contains("godot", StringComparison.OrdinalIgnoreCase))
+            var key = source.Attribute("key")?.Value;
+            var value = source.Attribute("value")?.Value;
+            if (key is null || value is null || value.Contains("://", StringComparison.Ordinal))
                 continue;
-            try
-            {
-                File.SetUnixFileMode(file, File.GetUnixFileMode(file)
-                    | UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute);
-            }
-            catch (IOException) { }
-            catch (PlatformNotSupportedException) { }
+
+            var directory = Path.IsPathFullyQualified(value) ? value : Path.Combine(checkout, value);
+            if (Directory.Exists(directory))
+                continue;
+
+            log?.Report($"dropping NuGet source '{key}' ({value}): not present on this box");
+            await RunAsync(dotnet, ["nuget", "remove", "source", key, "--configfile", config],
+                checkout, log, ct, allowFailure: true);
         }
     }
 
-    private static GitHubApiFeed.ApiAsset? PickAsset(
-        GitHubApiFeed.ApiRelease release, IReadOnlyList<string> hints) =>
-        release.Assets.FirstOrDefault(a =>
-            hints.All(h => a.Name.Contains(h, StringComparison.OrdinalIgnoreCase)));
-
-    /// <summary>Substrings every candidate asset name must contain for this platform. The console
-    /// build is wanted on Windows: the plain one detaches from the terminal and the build output goes
-    /// nowhere.</summary>
-    private static string[] EditorAssetHints() =>
-        OperatingSystem.IsWindows() ? ["win", "console"]
-        : OperatingSystem.IsMacOS() ? ["macos"]
-        : ["linux"];
-
-    private static string? FindGodotBinary(string versionDir)
-    {
-        if (!Directory.Exists(versionDir))
-            return null;
-
-        return Directory.EnumerateFiles(versionDir, "*", SearchOption.AllDirectories)
-            .Where(f => Path.GetFileName(f).Contains("godot", StringComparison.OrdinalIgnoreCase))
-            .Where(f => !f.Contains("templates", StringComparison.OrdinalIgnoreCase))
-            .Where(f => OperatingSystem.IsWindows()
-                ? f.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
-                : Path.GetExtension(f) is "" or ".x86_64" or ".arm64")
-            .OrderByDescending(f => f.Contains("console", StringComparison.OrdinalIgnoreCase))
-            .FirstOrDefault();
-    }
-
-    /// <summary>Read the pinned engine version out of the checkout's own docs.</summary>
-    public static string? ReadGodotPin(string checkout)
-    {
-        var path = Path.Combine(checkout, "docs", "RUNNING.md");
-        if (!File.Exists(path))
-            return null;
-
-        var match = GodotPinPattern().Match(File.ReadAllText(path));
-        return match.Success ? match.Groups[1].Value : null;
-    }
-
-    [GeneratedRegex(@"godot[- ]?(\d+\.\d+\.\d+[-\w.]*)", RegexOptions.IgnoreCase)]
-    private static partial Regex GodotPinPattern();
-
-    private string Stage(string checkout, Request request, string buildId, string sha)
+    private string Stage(string checkout, string preset, string buildId, string sha, string platformKey)
     {
         var dirName = BuildRecord.SafeDirName(buildId);
         var destination = Path.Combine(paths.VersionsDir, dirName);
-        var exported = Path.Combine(checkout, "dist", request.Target);
+        var exported = GameCheckout.DistDir(checkout, preset);
 
         if (!Directory.Exists(exported))
-            throw new InvalidOperationException(
-                $"the export produced nothing at {exported}; check the preset name");
+            throw new SourceBuildException(SourceFailure.PackageFailed,
+                $"nothing to stage at {exported}");
 
         if (Directory.Exists(destination))
             Directory.Delete(destination, recursive: true);
         Directory.CreateDirectory(destination);
 
-        var root = request.Target;
-        CopyTree(exported, Path.Combine(destination, root));
+        CopyTree(exported, Path.Combine(destination, preset));
 
         builds.Register(new BuildRecord
         {
             Id = buildId,
             DirName = dirName,
             Version = sha[..7],
-            PlatformKey = PlatformKey.Current,
-            Layout = request.LocalDataDir is null
-                ? InstalledState.LayoutFat
-                : InstalledState.LayoutCore,
-            Root = root,
+            PlatformKey = platformKey,
+            // package.sh lays the content in beside the binary, so a source build is always the
+            // single-directory "fat" layout, never the shared-asset-store one.
+            Layout = InstalledState.LayoutFat,
+            Root = preset,
             Provider = BuildProviders.Source,
             InstalledAt = DateTimeOffset.UtcNow,
         });
 
-        return buildId;
+        return destination;
     }
 
+    /// <summary>Copy a tree, preserving symlinks as symlinks.
+    ///
+    /// The same failure ArchiveExtractor exists for: a macOS .app's Frameworks directory is symlinks,
+    /// and dereferencing them produces a bundle that looks complete and will not launch. It also keeps
+    /// the copy from following a link out of the tree.</summary>
     private static void CopyTree(string from, string to)
     {
         Directory.CreateDirectory(to);
-        foreach (var dir in Directory.GetDirectories(from, "*", SearchOption.AllDirectories))
-            Directory.CreateDirectory(dir.Replace(from, to));
-        foreach (var file in Directory.GetFiles(from, "*", SearchOption.AllDirectories))
-            File.Copy(file, file.Replace(from, to), overwrite: true);
+
+        foreach (var entry in new DirectoryInfo(from).EnumerateFileSystemInfos())
+        {
+            var destination = Path.Combine(to, entry.Name);
+
+            if (entry.LinkTarget is { } target)
+            {
+                try
+                {
+                    if (entry is DirectoryInfo)
+                        Directory.CreateSymbolicLink(destination, target);
+                    else
+                        File.CreateSymbolicLink(destination, target);
+                    continue;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Windows needs a privilege for this and Godot's Windows export has no symlinks
+                    // in it, so falling through to a plain copy is right there and wrong on macOS,
+                    // where the link is the point. Let the macOS case fail loudly instead.
+                    if (!OperatingSystem.IsWindows())
+                        throw;
+                }
+            }
+
+            if (entry is DirectoryInfo directory)
+                CopyTree(directory.FullName, destination);
+            else
+                File.Copy(entry.FullName, destination, overwrite: true);
+        }
     }
 
-    private static async Task RunAsync(string exe, string[] args, string workingDir,
-        IProgress<string>? log = null, CancellationToken ct = default, bool allowFailure = false)
+    /// <summary>A game-repo script's path, checked for existence first.
+    ///
+    /// Without the check, a checkout too old to carry the script fails as "python: can't open file",
+    /// which reads as a broken launcher. With it, the message names the file and says the ref predates
+    /// the tooling, which is the actual situation.</summary>
+    private static string Script(string checkout, string path, string description) =>
+        Relative(checkout, GameCheckout.Require(path, description));
+
+    /// <summary>Arguments are passed to the game's own scripts relative to the checkout, because the
+    /// checkout is the working directory and a relative path keeps their messages readable.
+    ///
+    /// Forward slashes on every platform. Python and the Windows API both take either, but one of
+    /// these arguments is a script path handed to bash, where a backslash is an escape character
+    /// waiting for the wrong filename to make it matter.</summary>
+    private static string Relative(string checkout, string path) =>
+        Path.GetRelativePath(checkout, path).Replace('\\', '/');
+
+    private static async Task RunAsync(string exe, IReadOnlyList<string> args, string workingDir,
+        IProgress<string>? log, CancellationToken ct, bool allowFailure = false,
+        string failureCode = SourceFailure.StepFailed)
     {
         var psi = new ProcessStartInfo(exe)
         {
@@ -308,49 +671,70 @@ public sealed partial class SourceProvider(LauncherPaths paths, BuildStore build
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            CreateNoWindow = true,
         };
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
 
-        using var process = Process.Start(psi)
-            ?? throw new InvalidOperationException($"could not start {exe}");
-
-        process.OutputDataReceived += (_, e) => { if (e.Data is not null) log?.Report(e.Data); };
-        process.ErrorDataReceived += (_, e) => { if (e.Data is not null) log?.Report(e.Data); };
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
-
-        await process.WaitForExitAsync(ct);
-
-        if (process.ExitCode != 0 && !allowFailure)
-            throw new InvalidOperationException(
-                $"{exe} {string.Join(' ', args)} exited with {process.ExitCode}");
-    }
-
-    private static async Task<string> CaptureAsync(string exe, string[] args, string workingDir,
-        CancellationToken ct)
-    {
-        var psi = new ProcessStartInfo(exe)
+        Process process;
+        try
         {
-            WorkingDirectory = workingDir,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-        };
-        foreach (var arg in args)
-            psi.ArgumentList.Add(arg);
+            process = Process.Start(psi)
+                      ?? throw new SourceBuildException(failureCode, $"could not start {exe}");
+        }
+        catch (Win32Exception ex)
+        {
+            throw new SourceBuildException(failureCode, $"could not run {exe}: {ex.Message}");
+        }
 
-        using var process = Process.Start(psi)
-            ?? throw new InvalidOperationException($"could not start {exe}");
-        var output = await process.StandardOutput.ReadToEndAsync(ct);
-        await process.WaitForExitAsync(ct);
-        return output;
-    }
+        // The last few lines, so a failure message carries the reason. The whole stream reaches the
+        // operator through `log`, but under --json the envelope is what a script reads, and an
+        // envelope saying only "exited with 1" sends them back to scroll a build log.
+        var tail = new Queue<string>();
 
-    private static string SafeSegment(string repo)
-    {
-        var name = repo.TrimEnd('/').Split('/').LastOrDefault() ?? "repo";
-        if (name.EndsWith(".git", StringComparison.Ordinal))
-            name = name[..^4];
-        return BuildRecord.SafeDirName(name);
+        void Record(string? line)
+        {
+            if (line is null)
+                return;
+            log?.Report(line);
+            lock (tail)
+            {
+                tail.Enqueue(line);
+                if (tail.Count > 12)
+                    tail.Dequeue();
+            }
+        }
+
+        using (process)
+        {
+            process.OutputDataReceived += (_, e) => Record(e.Data);
+            process.ErrorDataReceived += (_, e) => Record(e.Data);
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            try
+            {
+                await process.WaitForExitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                // A cancelled build must not leave a Godot export or a clone running. The operator
+                // pressed Ctrl-C expecting the work to stop, not to detach.
+                try { process.Kill(entireProcessTree: true); }
+                catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException) { }
+                throw;
+            }
+
+            if (process.ExitCode == 0 || allowFailure)
+                return;
+
+            string[] lines;
+            lock (tail)
+                lines = tail.ToArray();
+
+            throw new SourceBuildException(failureCode,
+                $"{Path.GetFileName(exe)} {string.Join(' ', args)} exited with {process.ExitCode}" +
+                (lines.Length == 0 ? "" : ":\n  " + string.Join("\n  ", lines)));
+        }
     }
 }

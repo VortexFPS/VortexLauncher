@@ -104,8 +104,10 @@ vortex server console <name>                               # live log tail, stdi
 vortex server update <name> [--build <id>|--latest]
 vortex server release <name> [--when now|end-of-match]     # return an orchestrated instance to local
 vortex builds list|pin|gc
-vortex source set <name> --repo <url> --ref <branch|tag|sha>
-vortex source build <name>
+vortex source set <name> [--repo <url>] [--ref <branch|tag|sha>] [--target <preset>] [--godot <path>]
+vortex source list|status <name>                           # status answers "can this box build it"
+vortex source build <name> [--target <preset>] [--skip-maps]
+vortex source remove <name> [--purge]                      # --purge also deletes the checkout
 
 vortex runner run|install-service|status
 vortex runner link <conductor-url>|unlink                  # opt in or out of official orchestration
@@ -222,16 +224,31 @@ rollback work identically for compiled and downloaded builds. Every step resumes
 
 1. `git clone --filter=blob:none` or `fetch` the configured repo (default `VortexFPS/VortexArena`, forks
    supported) at the configured ref.
-2. Toolchain ensure: pinned .NET SDK check, then the pinned Godot console binary and export templates,
-   auto-downloaded into a sha-verified cache. Templates run about 1 GB per ADR-0014, so the cache is shared
-   across builds. The version comes from the repo's `docs/RUNNING.md` pin, never a hardcoded constant.
-3. `dotnet build`, then `godot --headless --export-release <target>`.
-4. Stage the export into the build store tagged `source:{ref}@{sha}`.
-5. Resolve the data payload from the release feed's data artifact or a user-configured local directory.
+2. Toolchain ensure. The engine pin comes from the checkout's own `tools/engine-patches/engine.lock.json`,
+   never a hardcoded constant and never prose. The export TEMPLATE is fetched by the checkout's own
+   `tools/data/fetch-engine-template.py` into `tools/engine-templates/`, hash-verified against that
+   lockfile; the launcher does not download it, because a second downloader over one lockfile is how a
+   build comes to be patched in CI and stock locally. The Godot EDITOR is a different thing and is
+   resolved differently: `--godot`, then `$VORTEX_GODOT`/`$GODOT`, then PATH, with no download, because
+   the game's release publishes templates only and there is no pinned editor artifact to fetch.
+3. `dotnet build`, then `godot --headless --export-release <preset> <export_path from export_presets.cfg>`,
+   with `tools/verify-engine-template.py --preset-config` before it and `--patches --binary` after it. The
+   second is the only check that speaks to what shipped: an empty `custom_template/release` exports a
+   complete, launchable binary from the stock template without failing (G10, measured in the game repo).
+4. `tools/data/fetch-maps.py`, then `tools/package.sh --no-zip` to lay content beside the binary, then
+   stage into the build store tagged `source:{preset}:{ref}@{sha7}`. The preset is in the id because four
+   presets exist and two build on the same OS; without it the second would replace the first.
+5. The data payload comes from the checkout, which is what `package.sh` lays out. The release feed's data
+   artifact is not consulted: mixing a compiled binary with content from a different revision is a class
+   of bug nobody would think to look for.
+
+This deliberately shells out to the game repo's own scripts rather than reimplementing them, which makes
+those file paths a cross-repo contract. `Launcher.Core/GameCheckout.cs` is the one place they are named.
 
 Known failure modes: cross-OS exports are unreliable, so a runner builds only for its own platform
-(ADR-0014). Godot version skew between the repo pin and the cached toolchain fails hard with both versions
-named. Never fall through to "try anyway".
+(ADR-0014), and the preset's platform is read from the lockfile and refused before anything is built.
+Godot version skew between the repo pin and the editor fails hard with both versions named, as does a
+channel mismatch and a non-mono editor against a `engine.dotnet` pin. Never fall through to "try anyway".
 
 ## 7. Content fetch (maps)
 
