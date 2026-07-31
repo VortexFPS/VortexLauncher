@@ -5,7 +5,7 @@
              x:DataType="vm:SettingsViewModel">
 
   <Border Background="#161b26" BorderBrush="#263043" BorderThickness="1" CornerRadius="10"
-          Padding="20" Margin="24" MaxWidth="600" HorizontalAlignment="Center">
+          Padding="20" Margin="24" MaxWidth="700" HorizontalAlignment="Center">
     <ScrollViewer>
       <StackPanel Spacing="18">
 

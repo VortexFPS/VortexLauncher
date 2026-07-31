@@ -160,7 +160,11 @@ public sealed class LauncherSettingsStoreTests : IDisposable
 
         var loaded = Store().Load();
 
-        Assert.Equal(ReleaseChannels.Stable, loaded.Channel);
+        // Against the shipped default rather than a channel named here. The claim being made is
+        // "a corrupt file reads as the defaults", not "the default is stable" — the default is a
+        // product decision that has already moved once (stable → beta while the game is pre-1.0)
+        // and this test has no stake in which way it points.
+        Assert.Equal(new LauncherSettings().Channel, loaded.Channel);
         Assert.Equal(GameUpdateModes.Download, loaded.GameUpdates);
         Assert.False(loaded.HasChosenNotificationReach);
     }

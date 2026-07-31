@@ -15,8 +15,12 @@ public static class ReleaseChannels
     /// not just a filter.</summary>
     public const string Beta = "beta";
 
-    /// <summary>Anything unrecognised reads as stable. A settings file written by a newer launcher,
-    /// or hand-edited, must never quietly opt a player into prerelease builds.</summary>
+    /// <summary>Anything unrecognised reads as stable, which is deliberately NOT the same as the
+    /// shipped default (<see cref="LauncherSettings.Channel"/>, currently beta). The two answer
+    /// different questions: a file with no channel at all gets the product decision, while a file
+    /// carrying a value this launcher does not recognise — hand-edited, or written by a newer
+    /// version — gets the reading that cannot hurt. A typo must never be the thing that opts a
+    /// player into prerelease builds.</summary>
     public static string Normalize(string? channel) =>
         string.Equals(channel, Beta, StringComparison.OrdinalIgnoreCase) ? Beta : Stable;
 
@@ -34,8 +38,27 @@ public sealed record LauncherSettings
 
     public int Schema { get; init; } = CurrentSchema;
 
-    /// <summary>See <see cref="ReleaseChannels"/>.</summary>
-    public string Channel { get; init; } = ReleaseChannels.Stable;
+    /// <summary>See <see cref="ReleaseChannels"/>.
+    ///
+    /// Beta while the game is pre-1.0: everything published is a prerelease or close enough to one
+    /// that a player defaulted to stable would sit looking at an empty feed, and the point of the
+    /// launcher right now is to get builds in front of people. Two things this drags along, both
+    /// worth knowing before it flips back:
+    ///
+    /// Beta puts the DEFAULT path on <see cref="GitHubApiFeed"/> (<see cref="ChannelFeeds"/>),
+    /// because the manifest redirect structurally cannot see a prerelease. That feed is
+    /// unauthenticated GitHub API at 60 requests/hour, shared per source IP, where stable's is an
+    /// unmetered redirect. It is the reason <see cref="UpdateCheckInterval"/> has a floor at all,
+    /// and the reason that floor now applies to everyone rather than to the few who opted in.
+    ///
+    /// It does not change the launcher's own updates. Velopack's GithubSource treats prerelease as
+    /// "consider these too", not "only these", so a beta launcher still finds the full releases
+    /// <c>stable</c> publishes.
+    ///
+    /// Flipping this back to <see cref="ReleaseChannels.Stable"/> is a one-line change here, and
+    /// leaves every player who explicitly chose a channel where they put themselves — only files
+    /// with no channel key follow the default.</summary>
+    public string Channel { get; init; } = ReleaseChannels.Beta;
 
     /// <summary>Override for <see cref="LauncherPaths"/>'s root; null means the per-user default.</summary>
     public string? InstallRoot { get; init; }

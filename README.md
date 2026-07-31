@@ -127,6 +127,23 @@ Three separate questions, three separate settings, all in `settings.json` (schem
 Settings sheet. A schema-1 file needs no migration: every new field defaults to what its absence
 implied.
 
+**The channel** (`channel`) is a fourth, and it defaults to **`beta`** while the game is pre-1.0 —
+everything published is a prerelease or near enough that a player defaulted to stable would be
+looking at an empty feed. Two consequences, both real:
+
+- It puts the *default* path on `GitHubApiFeed`, because the `releases/latest` redirect structurally
+  cannot see a prerelease (`ChannelFeeds`). That is unauthenticated GitHub API at 60 requests/hour
+  per source IP, where stable's is an unmetered redirect. The `updateCheckMinutes` floor below now
+  applies to everyone rather than to the few who opted in.
+- It does **not** affect the launcher's own updates. Velopack's `GithubSource` reads `prerelease` as
+  "consider these too", not "only these", so a beta launcher still finds the full releases `stable`
+  publishes.
+
+An unrecognised value still reads as stable, which is deliberately not the same as the default: a
+file with no channel gets the product decision, a file with a typo gets the reading that cannot
+hurt. Flipping the default back is one line in `LauncherSettings.Channel`, and leaves anyone who
+picked a channel explicitly where they put themselves.
+
 **The game** (`gameUpdates`) defaults to `download` — fetch a new release in the background, then
 ask before switching to it. That split is the reason `InstallService` grew `StageAsync`/`Apply`: the
 install already did all its expensive, failure-prone work out-of-tree with a single
@@ -170,7 +187,8 @@ fails degrades to the banner, which has already said the same thing.
 Background checks run on a loop, not a timer, so a slow connection cannot stack a second check on
 top of the first. The interval (`updateCheckMinutes`, default 240) has a 15-minute floor for a
 reason: the beta channel asks `GitHubApiFeed` *first* (`ChannelFeeds`), and that is unauthenticated
-GitHub API at 60 requests/hour.
+GitHub API at 60 requests/hour. Now that beta is the default channel, that floor is load-bearing for
+every install rather than for the ones that opted in.
 
 **Not covered:** the CLI. `vortex install`/`update` still read `LauncherHttp.DefaultFeed` directly
 and honour neither `channel` nor any of these settings — `vortex update --check` is the only
@@ -396,10 +414,12 @@ names the `.nupkg` by filename; `assets.win.json` names the installer and the po
 any of them breaks the lookup that makes an installed launcher updatable.
 
 **Releases are published full, not prerelease.** `SelfUpdateService` passes
-`prerelease: settings.IsBeta`, so a prerelease reaches nobody on the stable channel. The corollary
-is that the beta channel currently has no publisher at all: nothing produces a prerelease, so
-`channel: beta` sees the same releases as stable. Worth wiring to `main` when there is something to
-beta-test.
+`prerelease: settings.IsBeta`, and Velopack reads that as "consider prereleases too" rather than
+"only prereleases", so a full release reaches both channels and a prerelease would reach only beta.
+Since nothing here publishes a prerelease, the launcher's beta channel currently sees exactly what
+stable sees — which is why defaulting players to beta costs nothing on the self-update path even
+though it changes which feed the *game* is looked up on. Wiring `main` to prereleases is the
+follow-up when there is something to beta-test.
 
 The launcher's own release train is **this repo**, not the game's. `LauncherConfig.LauncherRepo`
 exists next to `LauncherConfig.Repo` for that reason and `ReleaseTrainTests` holds them apart:

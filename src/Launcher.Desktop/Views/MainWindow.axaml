@@ -6,17 +6,22 @@
         x:Class="Launcher.Desktop.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Title="Vortex Arena Launcher"
-        Width="760" Height="480" MinWidth="620" MinHeight="400"
+        Width="860" Height="600" MinWidth="680" MinHeight="500"
         WindowStartupLocation="CenterScreen"
         Background="#0d1017">
 
+  <!-- On the window size above: it is set for the Settings sheet, not for this screen. Both sheets
+       render inside a ScrollViewer, so a short window never clipped them — it just meant Settings
+       opened already scrolling, with five sections, the relocation confirmation and the Save button
+       sharing about 430px. The extra height is what fixes that; the extra width keeps the sidebar
+       and the notes pane from tightening as the sheets widen with it. -->
   <Panel>
     <Grid RowDefinitions="Auto,Auto,*,Auto,Auto" Margin="24">
 
       <!-- header -->
       <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="0,0,0,16">
         <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="12">
-          <TextBlock Text="XONOTICGODOT" FontSize="28" FontWeight="Black" Foreground="#7fd4ff"/>
+          <TextBlock Text="VORTEX ARENA" FontSize="28" FontWeight="Black" Foreground="#7fd4ff"/>
           <TextBlock Text="launcher" FontSize="28" FontWeight="Thin" Foreground="#5a6478"/>
         </StackPanel>
         <Button Grid.Column="1" Content="Settings" Command="{Binding OpenSettingsCommand}"
