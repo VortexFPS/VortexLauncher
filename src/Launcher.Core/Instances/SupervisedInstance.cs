@@ -473,6 +473,19 @@ public sealed class SupervisedInstance : IDisposable
             return;
         }
 
+        // Stopped before the backoff, and this is load-bearing rather than bookkeeping: StartAsync
+        // returns immediately if State is already Running or Starting (its idempotency guard, which
+        // is what keeps two callers from racing a second process into existence). Leaving State at
+        // Running across the delay meant the restart below hit that guard and returned having done
+        // nothing — no second process, RestartCount incremented, "restarting in 2s" in the log, and
+        // an instance that reports Running with no process behind it. Every restart policy was
+        // silently a no-op; only Never behaved as documented, because Never is the branch above that
+        // does set the state.
+        //
+        // It is also the truthful value on its own terms. The process is gone and the next one is
+        // seconds away, so anything that probes during the backoff should see Stopped.
+        State = InstanceState.Stopped;
+
         RestartCount++;
         var backoff = TimeSpan.FromSeconds(Math.Min(60, Math.Pow(2, Math.Min(6, RestartCount))));
         Emit(LogStream.Runner, $"restarting in {backoff.TotalSeconds:F0}s (attempt {RestartCount})");
