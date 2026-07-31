@@ -132,8 +132,19 @@ internal static class MinisignFormat
 
     /// <summary>Uppercase hex, bytes reversed: minisign treats the id as a little-endian 64-bit
     /// number and prints it big-endian, so this is the form that can be pasted straight into a
-    /// comparison with the comment line of a .pub file.</summary>
-    internal static string KeyIdHex(byte[] keyId) => Convert.ToHexString(keyId.Reverse().ToArray());
+    /// comparison with the comment line of a .pub file.
+    ///
+    /// Reverses a copy in place rather than writing `keyId.Reverse().ToArray()`. On an array that
+    /// expression is not stably bound: from C# 14 the first-class span conversion makes
+    /// MemoryExtensions.Reverse (in-place, returns void) a better match than Enumerable.Reverse, so
+    /// the LINQ form stops compiling — and if it ever bound to the span overload without the
+    /// trailing call it would silently mutate the caller's key id instead.</summary>
+    internal static string KeyIdHex(byte[] keyId)
+    {
+        var reversed = (byte[])keyId.Clone();
+        Array.Reverse(reversed);
+        return Convert.ToHexString(reversed);
+    }
 
     /// <summary>Pulls the base64 payload lines out of a .pub or .minisig, skipping comment lines and
     /// returning the trusted comment when there is one. Carriage returns are stripped: the files are

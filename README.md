@@ -351,13 +351,79 @@ The launcher's data root moved with the rename, from `%LOCALAPPDATA%/XonoticGodo
 release carries a `SHA256SUMS` file and no platform zips, so no machine can be holding an install under
 the old root.
 
-## Packaging the launcher itself (deferred — ADR-0015 §7)
+## Releasing the launcher
 
-Velopack packages, not yet wired into a workflow:
+**`stable` is the release branch.** Any commit that lands on it publishes a GitHub release
+(`.github/workflows/release.yml`); work lands on `main` and is promoted by fast-forwarding `stable`
+onto the commit players should have. There is no tag to remember, which is the point — the manual
+alternative is how a repo ends up with code that has been "released" for weeks and no artifact
+anybody can install.
 
 ```bash
-dotnet publish src/Launcher.Desktop -c Release -r win-x64 --self-contained -o pub
-vpk pack -u VortexLauncher -v <ver> -p pub -e VortexLauncher.exe
+git checkout stable && git merge --ff-only main && git push
+```
+
+Versions are `<major>.<minor>.<run-number>`: major/minor from `<VersionPrefix>` in
+`Directory.Build.props`, patch from the workflow run number, so every stable commit is a strictly
+increasing semver without anybody maintaining a counter. Velopack only offers an update when the
+candidate sorts above what is installed, so that property is the requirement, not a convenience.
+Bump the minor by editing `Directory.Build.props`. A run whose tag already exists fails in the gate
+job rather than after three platforms have finished packaging.
+
+Nothing is packaged until `dotnet build` and `dotnet test` pass **in Release**, which is a stronger
+gate than `ci.yml`'s Debug run: `Launcher.Desktop` flips `OutputType` to `WinExe` under Release, so
+Debug-only CI was not compiling the configuration the artifacts are cut from.
+
+| Asset | Platform | Self-updates |
+|---|---|---|
+| `VortexLauncher-win-Setup.exe`, `-win-Portable.zip`, `-<ver>-full.nupkg`, `releases.win.json` | Windows | yes, Velopack |
+| `VortexLauncher-<ver>-linux-x64.tar.gz`, `-osx-arm64.tar.gz` | Linux, macOS | no |
+| `vortex-<ver>-{win-x64.zip,linux-x64.tar.gz,osx-arm64.tar.gz}` | all three | no |
+| `SHA256SUMS` | — | — |
+
+Three things about that table are worth the words:
+
+**Only Windows gets a Velopack package,** and the reason is icon assets, not effort. `vpk pack`
+wants an AppImage icon on Linux and an `.icns` on macOS, and the only image in this repo is
+`src/Launcher.Desktop/Assets/tray-icon.png`, sized for a tray. Self-update is already inert off
+Windows — `UpdateManager.IsInstalled` is false for anything not Velopack-installed — so a tarball
+is honest about what it is, where a package would advertise an update path it does not have.
+Producing real icon assets is the prerequisite for changing this; macOS additionally has no signing
+identity and no Mac in CI.
+
+**Nothing renames vpk's output.** `releases.win.json` is the index `GithubSource` reads and it
+names the `.nupkg` by filename; `assets.win.json` names the installer and the portable zip. Renaming
+any of them breaks the lookup that makes an installed launcher updatable.
+
+**Releases are published full, not prerelease.** `SelfUpdateService` passes
+`prerelease: settings.IsBeta`, so a prerelease reaches nobody on the stable channel. The corollary
+is that the beta channel currently has no publisher at all: nothing produces a prerelease, so
+`channel: beta` sees the same releases as stable. Worth wiring to `main` when there is something to
+beta-test.
+
+The launcher's own release train is **this repo**, not the game's. `LauncherConfig.LauncherRepo`
+exists next to `LauncherConfig.Repo` for that reason and `ReleaseTrainTests` holds them apart:
+publishing launcher packages to the game repo would resolve `releases/latest` there to a non-game
+release, 404 `latest.json` and silently drop every launcher onto the rate-limited API feed. This
+supersedes ADR-0015 §7, which predates the extraction.
+
+Not covered: **no Velopack round trip has been run.** `vpk pack` output was verified against a real
+1.2.0 run — the tool confirms `VelopackApp.Run()` is wired, and the assets are what the table says
+— but installing a `Setup.exe` and having it update itself to the next release needs two releases
+and a Windows box. The second stable commit is the first chance to see it work.
+
+Also not covered: **the SDK is not pinned.** `setup-dotnet`'s `dotnet-version: 8.0.x` only
+guarantees 8.0.x is *present*; `dotnet` picks the highest SDK on the image, which is how a C# 14
+overload-resolution change broke three commits on `main` that compiled locally. `<LangVersion>` is
+pinned in `Directory.Build.props`, which closes the language half. A `global.json` would close the
+rest, and is not here only because it would require every dev box to install the 8.0 SDK
+specifically.
+
+Packing by hand, which is what the workflow does per platform:
+
+```bash
+dotnet publish src/Launcher.Desktop -c Release -r win-x64 --self-contained -p:Version=<ver> -o pub
+vpk pack --packId VortexLauncher --packVersion <ver> --packDir pub --mainExe VortexLauncher.exe
 ```
 
 ## Known prototype gaps
@@ -372,11 +438,13 @@ vpk pack -u VortexLauncher -v <ver> -p pub -e VortexLauncher.exe
   a real bundle.
 - No settings UI — **fixed**, and now carries the channel, the install root, both update policies,
   the notification reach and the check interval.
-- **Nothing here has run against a real Velopack-installed launcher**, because nothing packages one
-  yet (ADR-0015 §7, still deferred). The self-update paths are guarded by `UpdateManager.IsInstalled`
-  and are inert without it, so what is exercised today is the check, the mode branching and the
-  restart gate — not an actual restart into a new build. The Windows toast has the same gap for the
-  same reason: it wants the Start Menu shortcut a Velopack install creates.
+- **Nothing here has run against a real Velopack-installed launcher.** A commit to `stable` now
+  packages one (see *Releasing the launcher*), which closes the half of this gap that was "nothing
+  produces a package". What remains is that nobody has installed the `Setup.exe` and watched it
+  update itself: that needs two releases and a Windows box. The self-update paths are guarded by
+  `UpdateManager.IsInstalled` and are inert without it, so what is exercised today is the check, the
+  mode branching and the restart gate — not an actual restart into a new build. The Windows toast
+  has the same gap for the same reason: it wants the Start Menu shortcut a Velopack install creates.
 - **The tray reach is the least exercised of the three.** Close-to-tray, the tray menu and autostart
   registration are written and build, but autostart has only been reasoned about per platform, not
   run: `reg.exe` on Windows, `~/.config/autostart` on Linux, a LaunchAgent plist on macOS.

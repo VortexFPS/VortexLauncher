@@ -5,8 +5,25 @@ namespace Launcher.Core;
 /// <summary>The one place the distribution endpoints live (ADR-0015 §5).</summary>
 public static class LauncherConfig
 {
+    /// <summary>The GAME's repo. Everything below about feeds, manifests and artifacts is about
+    /// this one, and so is the default clone source for <c>vortex source build</c>. The launcher's
+    /// own releases are somewhere else — see <see cref="LauncherRepo"/>.</summary>
     public const string Repo = "VortexFPS/VortexArena";
     public const string RepoUrl = $"https://github.com/{Repo}";
+
+    /// <summary>The LAUNCHER's own repo, and the only thing Velopack self-update should ever look
+    /// at (<c>Launcher.Desktop/SelfUpdateService.cs</c>).
+    ///
+    /// Separate from <see cref="Repo"/> since the extraction, and the split is load-bearing in both
+    /// directions. ADR-0015 §7 originally had launcher packages riding the game's release train,
+    /// which made one constant correct for both; the launcher then became its own repo with its own
+    /// cadence, and §7 is superseded. Pointing self-update back at the game repo does not merely
+    /// fail to find packages — publishing launcher packages *there* would resolve
+    /// <c>releases/latest</c> to a non-game release, 404 <see cref="LatestManifestUrl"/> and drop
+    /// every launcher onto the rate-limited API fallback. The two release trains have to stay
+    /// apart. <c>ReleaseRepoUrlsAreDistinct</c> in the test suite holds this open.</summary>
+    public const string LauncherRepo = "VortexFPS/VortexLauncher";
+    public const string LauncherRepoUrl = $"https://github.com/{LauncherRepo}";
 
     /// <summary>Prefixes on the game's release artifacts: "&lt;prefix&gt;-&lt;ver&gt;-&lt;target&gt;.zip",
     /// "&lt;prefix&gt;-assets-&lt;hash12&gt;.zip", and the binary names in <see cref="PlatformKey"/>.

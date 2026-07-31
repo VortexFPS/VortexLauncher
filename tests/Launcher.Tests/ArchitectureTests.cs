@@ -99,7 +99,9 @@ public class ArchitectureTests
         return File.Exists(path) ? path : null;
     }
 
-    private static string RepoRoot()
+    /// <summary>Shared with the other tests that read the repo as data rather than reflecting over
+    /// it (<see cref="ReleaseTrainTests"/>).</summary>
+    internal static string RepoRoot()
     {
         for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
             if (File.Exists(Path.Combine(dir.FullName, "VortexLauncher.sln")))

@@ -2,7 +2,10 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # stable as well as main. release.yml gates on its own build and test run, so this is not what
+    # protects a release — it is so that the branch players are served from has an ordinary CI
+    # result next to it, in the same shape as every other branch.
+    branches: [main, stable]
   pull_request:
   workflow_dispatch:
 

@@ -12,3 +12,7 @@ Releases/
 
 # Local scratch
 _scratch/
+
+# IDE
+.idea/
+.vs/

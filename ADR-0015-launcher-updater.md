@@ -133,7 +133,22 @@ Non-negotiable invariants, in priority order:
 3. **Resumable downloads** (HTTP Range) — mandatory at 1.5 GB first-install sizes.
 4. **Rollback** — previous version dir retained; `current.json` flips back on demand.
 
-### 7. Release train: the launcher ships with the game release
+### 7. Release train: the launcher ships with the game release — ~~SUPERSEDED~~
+
+> **Superseded by the extraction.** The launcher is now its own repo (`VortexFPS/VortexLauncher`)
+> with its own release cadence, and its packages ship on **its own** `v*` releases, cut by
+> `.github/workflows/release.yml` on every commit to `stable`. `LauncherConfig.LauncherRepo` is the
+> repo `GithubSource` is pointed at; `LauncherConfig.Repo` remains the game.
+>
+> A shared release train is no longer merely unnecessary, it is actively harmful. GitHub resolves
+> `releases/latest` to the newest non-draft, non-prerelease release of a repo, so a launcher release
+> published to the *game* repo hijacks that redirect: `latest.json` 404s and every launcher in the
+> field falls back to the unauthenticated API feed at 60 requests/hour. The failure is quiet — the
+> launcher keeps working, just rate-limited — which is why `ReleaseTrainTests` asserts the two repos
+> stay distinct rather than leaving it to this note.
+>
+> What survives from the original decision is the reasoning below about version stories, now applied
+> within one repo instead of across two. The rest is kept for the record.
 
 Launcher Velopack packages (`vpk pack` output) attach to the **same `v*` release** as the game
 zips — one release train, one version story, and `GithubSource` always finds its packages on the

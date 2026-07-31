@@ -24,7 +24,25 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <LangVersion>latest</LangVersion>
+    <!-- Pinned to the language version that ships with the net8.0 above, NOT `latest`.
+
+         `latest` means the language is whatever the newest SDK on the machine implements, which is
+         a different language on CI than on a dev box and changes under you on a runner-image bump.
+         That is not hypothetical here: the hosted images gained a .NET 10 SDK, `dotnet` picks the
+         highest installed SDK when there is no global.json (setup-dotnet's `dotnet-version: 8.0.x`
+         only guarantees 8.0.x is *present*), and C# 14's first-class span conversions re-bound
+         `byte[].Reverse()` in Signing/Minisign.cs from Enumerable.Reverse to the void-returning
+         MemoryExtensions.Reverse. Three commits landed on main compiling locally on SDK 9 and
+         failing CI on SDK 10 with CS0023.
+
+         The stronger fix is a global.json pinning the SDK itself, which also pins Roslyn and the
+         analyzers; it is not here only because it would require every dev box to install the 8.0
+         SDK specifically. Worth doing when that is acceptable. -->
+    <LangVersion>12.0</LangVersion>
+    <!-- Release version. CI overrides the patch per build (see .github/workflows/release.yml);
+         bump the major/minor here by hand. Without this every assembly reports 1.0.0.0, which
+         LauncherConfig.UserAgent and RunnerLink both put on the wire as fact. -->
+    <VersionPrefix>0.1.0</VersionPrefix>
     <Deterministic>true</Deterministic>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>

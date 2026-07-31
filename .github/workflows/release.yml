@@ -1,0 +1,335 @@
+name: release
+
+# Publishes a GitHub release for every commit that lands on `stable`.
+#
+# `stable` is the release branch and nothing else: work lands on `main`, and promoting it is a
+# fast-forward of `stable` onto the commit you want players to have. That is the whole gate. There
+# is no tag to remember to push and no manual step that can be skipped, which is the point — the
+# alternative, tagging by hand, is how a repo ends up with code that has been "released" for weeks
+# and no artifact anybody can install.
+#
+# What a release carries, and why it is three different shapes:
+#
+#   - The WINDOWS launcher as a Velopack package (Setup.exe, the portable zip, a full .nupkg and
+#     releases.win.json). This is the only artifact self-update can consume: SelfUpdateService
+#     points a Velopack GithubSource at THIS repo (LauncherConfig.LauncherRepoUrl) and that source
+#     finds its packages by reading releases.win.json off the newest release. Nothing here may
+#     rename vpk's output for that reason.
+#   - The LINUX and MACOS launcher as plain self-contained tarballs, NOT Velopack. `vpk pack` wants
+#     an AppImage icon on Linux and a .icns on macOS, and the only image in this repo is a
+#     tray-sized PNG. Self-update is already inert on those platforms (UpdateManager.IsInstalled is
+#     false for anything not Velopack-installed), so a tarball is honest about what it is rather
+#     than a package that claims an update path it does not have. Real icon assets are the
+#     prerequisite for changing this, not workflow changes.
+#   - The `vortex` CLI for all three, self-contained. This is what an operator installs on a box to
+#     run `vortex runner run`, and until this workflow existed there was no way to obtain it that
+#     did not involve a .NET SDK and a checkout.
+#
+# Releases are published FULL, not prerelease, and that is load-bearing rather than cosmetic:
+# SelfUpdateService passes `prerelease: settings.IsBeta`, so a player on the stable channel is
+# served by a source that filters prereleases out entirely. A prerelease here reaches nobody on
+# stable. (Which also means the beta channel currently has no publisher — see the README.)
+
+on:
+  push:
+    branches: [stable]
+  # Re-running a release by hand is occasionally the fastest way out of a half-published one (an
+  # asset upload that failed after the release object was created, say). The tag guard in `gate`
+  # keeps this from quietly overwriting a good release.
+  workflow_dispatch:
+
+# Read-only by default; only the job that creates the release gets more.
+permissions:
+  contents: read
+
+# Two commits landing on stable a minute apart would otherwise race, and the loser publishes an
+# older tree over a newer one. Queued rather than cancelled: a release that got as far as creating
+# the GitHub release object should finish attaching its assets.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Nothing is packaged until the suite is green. A broken build reaching `stable` should cost a red
+  # X, not a release that installs and does not work — and this repo has already had a compile
+  # failure sit on main for three commits.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # Recorded because it is not what you might assume: setup-dotnet guarantees 8.0.x is INSTALLED,
+      # and `dotnet` then picks the highest SDK on the image unless a global.json says otherwise.
+      # That gap is what put CS0023 on main (see the LangVersion comment in Directory.Build.props),
+      # so the version that actually compiled the release is worth having in the log.
+      - name: Which SDK is actually building this
+        run: dotnet --version
+
+      # major.minor comes from Directory.Build.props so there is one place to bump it; the patch is
+      # the run number, which is monotonic per workflow and needs no state. Velopack only offers an
+      # update when the candidate version sorts above the installed one, so "strictly increasing
+      # without anybody having to remember" is the requirement being met here.
+      #
+      # sed rather than grep -oP: this expression is duplicated on the Windows leg, where the shell
+      # is Git Bash and PCRE support in grep is not something to rely on.
+      - name: Work out the version
+        id: version
+        run: |
+          base=$(sed -n 's|.*<VersionPrefix>\([^<]*\)</VersionPrefix>.*|\1|p' Directory.Build.props)
+          if [ -z "$base" ]; then
+            echo "::error::no <VersionPrefix> in Directory.Build.props to derive a version from"
+            exit 1
+          fi
+          version="${base%.*}.${GITHUB_RUN_NUMBER}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "releasing $version from $GITHUB_SHA"
+
+          # A re-run of a run number that already shipped would otherwise fail late, after three
+          # platforms have finished packaging, with whatever `gh release create` says about a
+          # duplicate tag. Fail here instead and say what to do about it.
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "::error::v$version is already released. Bump <VersionPrefix> in Directory.Build.props."
+            exit 1
+          fi
+
+      # Release, not Debug: Release is what ships, and it is not the same build. Launcher.Desktop
+      # flips OutputType to WinExe under Release, and the whole point of a gate is to compile the
+      # configuration the artifacts are cut from.
+      - name: Build
+        run: dotnet build VortexLauncher.sln -c Release --nologo
+
+      - name: Test
+        run: dotnet test VortexLauncher.sln -c Release --no-build --nologo
+
+      # Same assertion ci.yml makes, for the same reason, on the branch where it matters most.
+      # Losing Nullable is silent: the code compiles and stops being null-checked.
+      - name: Assert the inherited build properties are still set
+        run: |
+          for prop in ImplicitUsings Nullable; do
+            if ! grep -q "<$prop>enable</$prop>" Directory.Build.props; then
+              echo "::error::Directory.Build.props no longer sets $prop=enable. See the README section"
+              echo "::error::'Why Directory.Build.props exists here' before releasing."
+              exit 1
+            fi
+          done
+
+  package:
+    needs: gate
+    strategy:
+      # One platform failing must not cancel the others. A Windows-only failure and a
+      # macOS-only failure need different fixes, and finding them one release at a time is slow.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+            velopack: true
+          - os: ubuntu-latest
+            rid: linux-x64
+            velopack: false
+          # arm64: every Mac Apple still sells is arm64, and an x64 build would be the one that
+          # needs Rosetta. Revisit only if an Intel Mac player turns up.
+          - os: macos-latest
+            rid: osx-arm64
+            velopack: false
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # bash on all three, including Windows, so this is one script rather than three. Named
+        # explicitly to get `-eo pipefail` — the implicit Linux shell is `bash -e` with no pipefail.
+        shell: bash
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      RID: ${{ matrix.rid }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Publish the vortex CLI
+        run: |
+          dotnet publish src/Launcher.Cli -c Release -r "$RID" --self-contained \
+            -p:Version="$VERSION" -o "stage/cli" --nologo
+
+      - name: Publish the launcher
+        run: |
+          dotnet publish src/Launcher.Desktop -c Release -r "$RID" --self-contained \
+            -p:Version="$VERSION" -o "stage/launcher" --nologo
+
+      # Velopack's own tool, pinned to the same version as the Velopack PackageReference the app
+      # links. A vpk that disagrees with the runtime library is how you get a package that installs
+      # and then cannot read its own release feed, so the version is read out of the csproj rather
+      # than written down a second time here.
+      - name: Pack the launcher with Velopack
+        if: matrix.velopack
+        run: |
+          vpk_version=$(sed -n 's|.*Include="Velopack" Version="\([^"]*\)".*|\1|p' \
+            src/Launcher.Desktop/Launcher.Desktop.csproj)
+          if [ -z "$vpk_version" ]; then
+            echo "::error::could not read the Velopack version out of Launcher.Desktop.csproj"
+            exit 1
+          fi
+          echo "using vpk $vpk_version"
+          # The update fallback is for a self-hosted runner that already has some vpk on it; on a
+          # hosted image the install always wins.
+          dotnet tool install -g vpk --version "$vpk_version" \
+            || dotnet tool update -g vpk --version "$vpk_version"
+          export PATH="$PATH:$HOME/.dotnet/tools"
+
+          # VortexLauncher.exe, matching <AssemblyName>. VelopackApp.Build().Run() is already the
+          # first statement in Program.cs, which is what makes the packaged app handle its own
+          # install/update/uninstall hooks.
+          vpk pack \
+            --packId VortexLauncher \
+            --packVersion "$VERSION" \
+            --packDir stage/launcher \
+            --mainExe VortexLauncher.exe \
+            --outputDir dist
+
+          # Deliberately not renamed. GithubSource locates the .nupkg through releases.win.json, and
+          # that index refers to the file by the name vpk gave it.
+          ls -la dist
+
+      # tar.gz rather than a zip so the executable bit survives, which matters for both of these:
+      # one is a launcher a player double-clicks and the other is a binary an operator runs from a
+      # systemd unit.
+      - name: Archive the launcher (no Velopack on this platform)
+        if: ${{ !matrix.velopack }}
+        # COPYFILE_DISABLE keeps BSD tar on macOS from writing an AppleDouble ._ sidecar next to
+        # every entry; harmless, but it doubles the file count and confuses anyone who extracts it
+        # on Linux.
+        env:
+          COPYFILE_DISABLE: "1"
+        run: |
+          mkdir -p dist
+          tar -czf "dist/VortexLauncher-$VERSION-$RID.tar.gz" -C stage/launcher .
+
+      - name: Archive the vortex CLI
+        env:
+          COPYFILE_DISABLE: "1"
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            # 7z is on the hosted Windows image. A zip here because the audience is a Windows
+            # operator, and Explorer opens a zip and does not open a tarball.
+            7z a -tzip "dist/vortex-$VERSION-$RID.zip" ./stage/cli/* > /dev/null
+          else
+            tar -czf "dist/vortex-$VERSION-$RID.tar.gz" -C stage/cli .
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.rid }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [gate, package]
+    runs-on: ubuntu-latest
+    # The only job that gets write. Creating the release also creates the tag, so nothing needs to
+    # push a ref of its own.
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      TAG: ${{ needs.gate.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      # Every platform is required. `package` runs fail-fast: false so that a broken platform is
+      # diagnosable, not so that a release can ship without it — a release missing its Windows
+      # Velopack assets is one that no installed launcher can update to, and it would still be the
+      # release GithubSource resolves to.
+      # The Velopack names here are vpk's, verified against a real `vpk pack 1.2.0` run rather than
+      # guessed: releases.win.json is the index GithubSource reads and it names the .nupkg and only
+      # the .nupkg, so that pair is what an installed launcher needs in order to update at all. The
+      # Setup.exe and the portable zip appear in assets.win.json instead, which is vpk's own upload
+      # manifest — which is also the reason nothing in this workflow renames any of them.
+      - name: Check the release is complete before creating it
+        run: |
+          cd dist
+          ls -la
+          missing=0
+          for f in \
+            "vortex-$VERSION-win-x64.zip" \
+            "vortex-$VERSION-linux-x64.tar.gz" \
+            "vortex-$VERSION-osx-arm64.tar.gz" \
+            "VortexLauncher-$VERSION-linux-x64.tar.gz" \
+            "VortexLauncher-$VERSION-osx-arm64.tar.gz" \
+            "VortexLauncher-$VERSION-full.nupkg" \
+            "VortexLauncher-win-Setup.exe" \
+            "VortexLauncher-win-Portable.zip" \
+            "releases.win.json"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f is missing from the release"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+      # Same shape as the game repo's releases, and the thing to check against before trusting a
+      # download that arrived over anything but this workflow.
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release notes
+        run: |
+          cat > notes.md <<EOF
+          Launcher release \`$VERSION\`, built from \`${GITHUB_SHA:0:7}\` on \`stable\`.
+
+          ### Windows
+
+          \`VortexLauncher-win-Setup.exe\` — the installed launcher. Only this one self-updates:
+          later releases are picked up automatically (or on your say-so, depending on the
+          **launcher updates** setting).
+
+          ### Linux and macOS
+
+          \`VortexLauncher-$VERSION-<platform>.tar.gz\` — self-contained, extract and run. These are
+          **not** self-updating; installing a new launcher means downloading the next one.
+
+          ### Servers
+
+          \`vortex-$VERSION-<platform>\` — the CLI and runner daemon. \`vortex runner install\` writes
+          the systemd unit.
+
+          Verify anything here against \`SHA256SUMS\`.
+          EOF
+          cat notes.md
+
+      # --target pins the release to the commit that triggered it rather than to whatever `stable`
+      # points at by the time this job runs, and creates the tag as a side effect.
+      #
+      # Full release, not prerelease: the stable channel's GithubSource filters prereleases out, so
+      # a prerelease here would be invisible to every player it is meant for.
+      - name: Publish
+        run: |
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            --generate-notes \
+            --latest \
+            dist/*
+
+          echo "### Released [$TAG](${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG)" \
+            >> "$GITHUB_STEP_SUMMARY"

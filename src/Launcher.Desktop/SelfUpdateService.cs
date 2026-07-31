@@ -75,8 +75,12 @@ public sealed class SelfUpdateService
         {
             // Rebuilt per check rather than cached: the source encodes the channel, so a player who
             // switches to beta in settings would otherwise keep asking the stable source until restart.
+            //
+            // LauncherRepoUrl, not RepoUrl: the launcher's packages are on the launcher's own
+            // releases. This read RepoUrl (the game repo) until releases were stood up here, which
+            // was correct only while ADR-0015 §7's shared release train was the plan.
             var mgr = new UpdateManager(
-                new GithubSource(LauncherConfig.RepoUrl, accessToken: null, prerelease: settings.IsBeta));
+                new GithubSource(LauncherConfig.LauncherRepoUrl, accessToken: null, prerelease: settings.IsBeta));
 
             if (!mgr.IsInstalled)
                 return new SelfUpdateResult(SelfUpdateState.Inert, "dev build — self-update inert");
@@ -134,7 +138,7 @@ public sealed class SelfUpdateService
         try
         {
             var mgr = new UpdateManager(
-                new GithubSource(LauncherConfig.RepoUrl, accessToken: null, prerelease: settings.IsBeta));
+                new GithubSource(LauncherConfig.LauncherRepoUrl, accessToken: null, prerelease: settings.IsBeta));
             await mgr.DownloadUpdatesAsync(_pending, cancelToken: ct);
             _downloaded = true;
             return new SelfUpdateResult(SelfUpdateState.Ready,
@@ -162,7 +166,7 @@ public sealed class SelfUpdateService
             // The channel is irrelevant here — the update was already chosen and downloaded; this
             // source exists only because ApplyUpdatesAndRestart hangs off an UpdateManager.
             var mgr = new UpdateManager(
-                new GithubSource(LauncherConfig.RepoUrl, accessToken: null, prerelease: false));
+                new GithubSource(LauncherConfig.LauncherRepoUrl, accessToken: null, prerelease: false));
             mgr.ApplyUpdatesAndRestart(_pending!); // exits this process
             return true;
         }
