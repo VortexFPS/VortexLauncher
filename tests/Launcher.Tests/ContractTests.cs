@@ -229,8 +229,12 @@ public class RouteContractTests : ScratchTest
         store.Save(new InstanceSpec { Name = Instance, Map = "stormkeep", Port = 26010 });
         supervisor.LoadAndAdopt();
 
+        // paths is passed so the /sources routes are actually reached. Without it they answer 404 for
+        // having no install root, which is not the "no route for" 404 this suite looks for — so every
+        // source endpoint would pass whether or not it was ever routed.
         return (supervisor,
-            new CommandDispatcher(supervisor, builds, new ContentFetcher(paths, new HttpClient())));
+            new CommandDispatcher(supervisor, builds, new ContentFetcher(paths, new HttpClient()),
+                paths: paths));
     }
 
     private static CommandEnvelope Command(string method, string path, string? body = null) => new()

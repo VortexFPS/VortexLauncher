@@ -11,8 +11,17 @@ namespace Launcher.Core.Instances;
 /// is why adding a verb here gives both planes the feature with no protocol change.</summary>
 public sealed class CommandDispatcher(
     InstanceSupervisor supervisor, BuildStore builds,
-    ContentFetcher? content = null, string? contentBaseUrl = null, string? conductorUrl = null)
+    ContentFetcher? content = null, string? contentBaseUrl = null, string? conductorUrl = null,
+    LauncherPaths? paths = null, SourceBuildJobs? sourceBuilds = null)
 {
+    /// <summary>The source routes need a root to read specs and checkouts out of. Optional in the same
+    /// way <paramref name="content"/> is: a dispatcher built without one still serves every other verb,
+    /// and the source routes answer 404 rather than the process failing to start.</summary>
+    private readonly SourceBuildJobs? _sourceBuilds =
+        sourceBuilds ?? (paths is null ? null : new SourceBuildJobs(paths));
+
+    private SourceStore? Sources => paths is null ? null : new SourceStore(paths);
+
     public async Task<CommandResult> ExecuteAsync(CommandEnvelope command, ControlOrigin origin,
         CancellationToken ct)
     {
@@ -90,6 +99,9 @@ public sealed class CommandDispatcher(
 
         if (segments is ["content"])
             return (ProtocolStatus.Ok, CachedContent());
+
+        if (segments is ["sources", ..])
+            return SourceRoute(command, origin, segments);
 
         if (segments is ["instances"])
         {
@@ -219,6 +231,173 @@ public sealed class CommandDispatcher(
         }
     }
 
+    /// <summary>Building the game from a git checkout, rather than installing a published release.
+    ///
+    /// <para><b>Everything that mutates is local-origin only, and this is the important line in the
+    /// file.</b> A source build clones a repository the CALLER names and compiles it here. Exposed to an
+    /// orchestrator that would be arbitrary code execution addressed by URL, on a box a community
+    /// operator lent to a network — categorically different from the instance routes, which only ever
+    /// start a binary the owner already installed and only ever from the build store. Reads stay open to
+    /// both planes: what a box could build is no more sensitive than the builds and status it already
+    /// publishes, and an orchestrator being able to see that a build is running is what stops it
+    /// treating a busy box as an idle one.</para>
+    ///
+    /// <para>The build itself is a job rather than a call, because it runs for tens of minutes and every
+    /// other verb here answers inside a 30-second envelope. See <see cref="SourceBuildJobs"/>.</para></summary>
+    private (int Status, object? Body) SourceRoute(CommandEnvelope command, ControlOrigin origin,
+        string[] segments)
+    {
+        if (Sources is not { } store || _sourceBuilds is null)
+            return (ProtocolStatus.NotFound, ApiError.Of(ApiErrorCodes.InvalidRequest,
+                "this runner was started without an install root, so it serves no source routes"));
+
+        if (command.Method != ProtocolMethods.Get && origin != ControlOrigin.Local)
+            return (ProtocolStatus.Forbidden, ApiError.Of(ApiErrorCodes.ScopeDenied,
+                "source builds are the host owner's alone. This call compiles a repository named in " +
+                "the request, so it is only accepted from the local plane — an orchestrator can read " +
+                "what this box has built and watch a running build, but cannot start one."));
+
+        var name = segments.Length > 1 ? segments[1] : null;
+        var action = segments.Length > 2 ? segments[2] : null;
+
+        // ---- /sources ----------------------------------------------------------------------------
+        if (name is null)
+        {
+            if (command.Method == ProtocolMethods.Get)
+                return (ProtocolStatus.Ok, store.List().Select(Describe).ToList());
+
+            // A request record rather than SourceSpec: the spec's Name and Repo are `required`, which
+            // System.Text.Json enforces, so posting {"name","ref"} to change a ref would be rejected
+            // for omitting a field this route is meant to leave alone.
+            var request = Body<SourceRequest>(command)
+                ?? throw new ArgumentException("a source spec is required");
+
+            if (request.Name is not { Length: > 0 } requested)
+                throw new ArgumentException("a source name is required");
+
+            SourceStore.ValidateName(requested);
+
+            // Update in place, matching `source set`: a call that named only a ref must not silently
+            // reset the repo it was pointed at.
+            var existing = store.Get(requested);
+            var spec = new SourceSpec
+            {
+                Name = requested,
+                Repo = string.IsNullOrWhiteSpace(request.Repo)
+                    ? existing?.Repo ?? $"{LauncherConfig.RepoUrl}.git"
+                    : request.Repo,
+                Ref = string.IsNullOrWhiteSpace(request.Ref) ? existing?.Ref ?? "main" : request.Ref,
+                Target = request.Target ?? existing?.Target,
+                GodotPath = request.Godot ?? existing?.GodotPath,
+                LastBuildId = existing?.LastBuildId,
+                LastBuiltSha = existing?.LastBuiltSha,
+                LastBuiltAt = existing?.LastBuiltAt,
+            };
+
+            store.Save(spec);
+            return (existing is null ? ProtocolStatus.Created : ProtocolStatus.Ok, Describe(spec));
+        }
+
+        // ---- /sources/{name}/build ---------------------------------------------------------------
+        if (action == "build")
+        {
+            if (command.Method == ProtocolMethods.Get)
+                return _sourceBuilds.Current is { } running
+                    ? (ProtocolStatus.Ok, running)
+                    : (ProtocolStatus.NotFound, ApiError.Of(ApiErrorCodes.InvalidRequest,
+                        "no source build has run on this box since the runner started"));
+
+            if (segments.Length > 3 && segments[3] == "cancel")
+                return _sourceBuilds.Cancel()
+                    ? (ProtocolStatus.Ok, _sourceBuilds.Current)
+                    : (ProtocolStatus.NotFound, ApiError.Of(ApiErrorCodes.InvalidRequest,
+                        "no source build is running"));
+
+            var spec = store.Get(name)
+                ?? throw new KeyNotFoundException(
+                    $"no source '{name}'; POST /sources creates one before it can be built");
+
+            var options = Body<SourceBuildRequest>(command) ?? new SourceBuildRequest();
+            var effective = spec with { Target = options.Target ?? spec.Target };
+
+            try
+            {
+                // 202: the body describes a build that has started, not one that has finished. A plane
+                // that treated this as 200-means-done would report success before the clone.
+                return (ProtocolStatus.Accepted,
+                    _sourceBuilds.Start(effective, options.FetchMaps, store));
+            }
+            catch (InvalidOperationException ex)
+            {
+                return (ProtocolStatus.Conflict, ApiError.Of(ApiErrorCodes.InvalidRequest, ex.Message));
+            }
+        }
+
+        // ---- /sources/{name} ---------------------------------------------------------------------
+        if (action is not null)
+            return (ProtocolStatus.NotFound, ApiError.Of(
+                ApiErrorCodes.InvalidRequest, $"no route for {command.Method} {command.Path}"));
+
+        if (command.Method == ProtocolMethods.Delete)
+            return store.Delete(name)
+                ? (ProtocolStatus.NoContent, null)
+                : (ProtocolStatus.NotFound, ApiError.Of(ApiErrorCodes.InvalidRequest,
+                    $"no source '{name}'"));
+
+        var found = store.Get(name)
+            ?? throw new KeyNotFoundException($"no source '{name}'");
+
+        // A short doctor budget, not the default two minutes: this answer has to be back inside the
+        // command envelope's 30 seconds. On a warm checkout doctor takes a moment; on a cold one it is
+        // skipped by timing out, which costs only the part of the report that was always optional.
+        var provider = new SourceProvider(paths!, builds);
+        var report = provider.Inspect(found, null, TimeSpan.FromSeconds(12));
+
+        return (ProtocolStatus.Ok, new
+        {
+            name = report.Name,
+            repo = report.Repo,
+            @ref = report.Ref,
+            checkout = report.Checkout,
+            checked_out = report.CheckedOut,
+            sha = report.Sha,
+            preset = report.Preset,
+            platform_key = report.PlatformKey,
+            engine_version = report.EngineVersion,
+            engine_tag = report.EngineTag,
+            template_present = report.TemplatePresent,
+            tools = report.Tools.Select(t => new { name = t.Name, ok = t.Ok, path = t.Path, problem = t.Problem }),
+            ready = report.Ready,
+            problems = report.Problems,
+            vx = report.VxDoctor is null ? null : (object)new
+            {
+                ok = report.VxDoctor.Ok,
+                unsupported_schema = report.VxDoctor.UnsupportedSchema,
+                checks = report.VxDoctor.Checks.Select(c => new
+                {
+                    name = c.Name, status = c.Status, detail = c.Detail,
+                    required = c.Required, fix = c.Fix,
+                }),
+            },
+            last_build_id = report.LastBuildId,
+            last_built_at = report.LastBuiltAt,
+        });
+    }
+
+    /// <summary>A source spec as a plane sees it. The preset is resolved rather than left null, because
+    /// null means "this platform's default" and the plane asking may not be on this platform.</summary>
+    private static object Describe(SourceSpec spec) => new
+    {
+        name = spec.Name,
+        repo = spec.Repo,
+        @ref = spec.Ref,
+        target = spec.Target ?? SourceProvider.DefaultPreset(),
+        godot = spec.GodotPath,
+        last_build_id = spec.LastBuildId,
+        last_built_sha = spec.LastBuiltSha,
+        last_built_at = spec.LastBuiltAt,
+    };
+
     /// <summary>This runner and everything it owns.
     ///
     /// Public because the runner link's heartbeat sends the same thing: a plane's cached status and
@@ -321,6 +500,29 @@ public sealed class CommandDispatcher(
     };
 
     private sealed record ExecRequest(string Command);
+
+    /// <summary>The body of POST /sources. Every field is optional, including the ones SourceSpec makes
+    /// required, because this route updates in place: naming only a ref must change only the ref.</summary>
+    private sealed record SourceRequest
+    {
+        public string? Name { get; init; }
+        public string? Repo { get; init; }
+        public string? Ref { get; init; }
+        public string? Target { get; init; }
+        public string? Godot { get; init; }
+    }
+
+    /// <summary>The body of POST /sources/{name}/build, overriding the stored spec for one run without
+    /// rewriting it.</summary>
+    private sealed record SourceBuildRequest
+    {
+        public string? Target { get; init; }
+
+        /// <summary>Defaults true, matching the CLI where skipping is the opt-in: a build with no maps
+        /// starts and then finds nothing to load, which reads as a broken game rather than a partial
+        /// build, so it is not the thing to get by saying nothing.</summary>
+        public bool FetchMaps { get; init; } = true;
+    }
 
     /// <summary>The body of the server.cfg routes, in both directions. The whole file as one string:
     /// it is a config the operator edits by hand in a text box, and anything structured here would be

@@ -109,9 +109,11 @@ cannot touch the box and every operation goes to a runner over the protocol.
 | Install | `src/Launcher.Core/InstallService.cs` | staging extract → atomic move → `current.json` flip; keeps N-1 for rollback; shared content-addressed asset store for `-core` installs |
 | Extract | `src/Launcher.Core/ArchiveExtractor.cs` | `System.IO.Compression` on Windows/Linux; `ditto` on macOS, where the managed extractor drops the `.app`'s symlinks |
 | Launch | `src/Launcher.Core/GameLauncher.cs` | spawns the game; `--data <store>` for core installs (complete installs self-resolve) |
-| Source build | `src/Launcher.Core/SourceProvider.cs` | clone, export, verify, package, stage; `vortex source *` in `src/Launcher.Cli/SourceCommands.cs` |
+| Source build | `src/Launcher.Core/SourceProvider.cs` | clone, export, verify, package, stage; `vortex source *`, the desktop sheet, and `/api/v1/sources` all drive this one class |
+| Source build jobs | `src/Launcher.Core/SourceBuildJobs.cs` | the runner's one build slot, so a tens-of-minutes build survives a 30-second command envelope |
+| The game's task runner | `src/Launcher.Core/Vx.cs` | finds and drives the checkout's own `./vx`, and reads `vx doctor --json` (schema 1) |
 | Engine pin | `src/Launcher.Core/GameCheckout.cs` | reads `engine.lock.json` and `export_presets.cfg` out of a checkout, and names every game-repo script the build shells out to |
-| Toolchain | `src/Launcher.Core/GodotToolchain.cs` | finds git/dotnet/python/bash and the Godot editor, and refuses an editor that is not the pinned engine |
+| Toolchain | `src/Launcher.Core/GodotToolchain.cs` | finds git/dotnet/python/bash and the Godot editor — `$VORTEX_GODOT`, `$GODOT`, the checkout's `.godot-bin/`, PATH, then the platform install location — and refuses an editor that is not the pinned engine |
 | Artifact names | `src/Launcher.Core/LauncherConfig.cs` | the accepted release-artifact prefixes; see the rename note below |
 | Update policy | `src/Launcher.Core/UpdatePolicy.cs` | the setting vocabularies and what an unrecognised value is allowed to mean |
 | Update check | `src/Launcher.Core/UpdateCheck.cs` | one verdict type, the polling loop, and once-per-version announcement |
@@ -240,10 +242,44 @@ or `linux-dedicated` by OS, the last because a Linux box running `vortex` is usu
 result is an ordinary entry in the build store, so `builds list`, `builds pin`, `builds gc` and
 `server create --build` treat a compiled build exactly like a downloaded one.
 
+**Three ways in, one implementation.** `SourceProvider` is driven by the CLI above, by the desktop
+app's *Build from source* sheet, and by `/api/v1/sources` on the runner API — so a source configured
+in one is the source the others see, over the same `sources.json` and the same build store.
+
+- **Desktop.** The sheet takes a name, repo, ref and preset, streams the build log, and stops there.
+  A finished build lands in the build store and becomes the installed game only when *Use this build*
+  is pressed — the same rule the release path follows, and it matters more here: someone building a
+  branch to test it is often not someone who wants to be left on it. The press is refused while the
+  game is running, because the swap rewrites `current.json` underneath it.
+- **Runner API.** `POST /api/v1/sources/{name}/build` answers **202 with a job that has started**, not
+  a build that has finished, and the plane polls `GET` on the same path. Every other runner verb
+  answers inside the 30-second command envelope; a build runs for tens of minutes. One at a time per
+  box — two builds contend for the same cores, disk and, if they name one source, the same checkout.
+  **Reads are open to both planes; everything that mutates is refused unless it came from the host
+  owner's own plane**, because these routes compile a repository named in the request, which exposed
+  to an orchestrator is arbitrary code execution addressed by URL. That is a different thing from the
+  instance routes, which only ever start a binary already in the build store.
+
 What the box has to have, all of it named in the refusal when it is absent: **git**, the **.NET SDK**,
 **Python 3**, **bash**, and a **Godot editor** of the version the checkout pins, mono/.NET build. On
 Windows the Git Bash that ships with git is used and the `bash` in `System32` is skipped, because that
 one is the WSL launcher and would run `package.sh` against `/mnt/c` inside a different filesystem.
+
+The editor is looked for at `--godot`, then `$VORTEX_GODOT`/`$GODOT`, then the checkout's own
+`.godot-bin/`, then PATH, then the platform install location (`C:\Program Files\Godot`,
+`/Applications/Godot*.app`, `/usr/{local/,}bin/godot`). Two of those are new and each fixes a real
+answer this repo was getting wrong:
+
+- **`.godot-bin/` ahead of PATH.** A checkout carrying `./vx` installs its own pinned editor there
+  with `./vx setup --profile dev`, and that is the one option which gets the version right by
+  construction instead of by the skew check catching it afterwards. It also lets two sources at two
+  refs pin two engine versions, which a single PATH entry cannot express.
+- **The platform install location at all.** vx and the game repo's `find-godot.sh` both look there and
+  this resolver did not, so on a box with a normal Godot install that never touched PATH — the usual
+  case on Windows and macOS — `vx doctor` reported a usable pinned editor while a source build on the
+  same machine refused for having none. Windows is enumerated rather than hardcoded to the pinned
+  filename the way vx does it, because the launcher builds arbitrary refs pinning arbitrary versions;
+  it takes what is installed, newest first, and lets the skew check be the thing with an opinion.
 
 **Where the engine comes from is the part worth reading.** The Godot *editor* drives the export and can
 be a stock download; the export *template* is what gets embedded in the shipped game and therefore
@@ -305,8 +341,12 @@ Three things to know before relying on it:
   `$do_zip && info ...`. CI always zips, so nothing noticed. The launcher therefore asserts on the
   output the way the release workflow asserts on the export's, and treats the exit code as advisory.
   Worth fixing in the game repo.
-- **Nothing but the CLI reaches it.** There is no `runner-api-v1.yaml` operation and no panel screen,
-  so a source build cannot be driven from the WebServer or from Conductor.
+- **The desktop sheet and the runner API have not been exercised end to end.** Both drive the same
+  `SourceProvider` the CLI does, and the routes, the refusal and the job lifecycle are covered by
+  tests — but no full build has been run through either surface, so what is unproven is the long tail
+  of a twenty-minute job: the log staying readable, cancellation landing, the pin at the end.
+- **The operator panel has no screen for it yet.** The API is there and documented, so Conductor and
+  the panel *can* read what a box has built and watch a running build; nothing in `wwwroot` calls it.
 
 ## The contract with the game repo
 
@@ -323,6 +363,29 @@ together.
 makes them a contract: renaming one, or changing `engine.lock.json`'s shape, breaks source builds in
 this repo. `GameCheckout` is the single place that names them, and a checkout missing one fails saying
 which file and that the ref predates the tooling.
+
+**`./vx`, the game repo's own task runner**, where it already owns a step. Its plan names this
+launcher as a consumer and versions `--json` as a shipping interface across the boundary, so
+`Core/Vx.cs` reads `vx doctor --json` and pins the schema number it understands — an envelope
+declaring a version this launcher does not read is reported as exactly that, never parsed hopefully.
+`Vx.Find` returns null on a ref that predates vx, so every use site keeps its old road.
+
+Which steps, and the three that deliberately stay put, is the part worth reading before adding a
+fourth:
+
+| step | driven by | why |
+|---|---|---|
+| export template | `vx engine --only <plat>` | Same lockfile, same sha256, same destination — but HttpClient instead of urllib. A python.org macOS install has no usable CA bundle, so the script dies `CERTIFICATE_VERIFY_FAILED` four retries deep on a box that is otherwise ready. The launcher inherited that by calling it. |
+| compiled maps | `vx maps` | Same trade, bigger download. |
+| preflight | `vx doctor --json` | Additive, never merged into `problems`, so a vx finding cannot decide `ready`. Earns its place on one check this side cannot make: whether the editor's stock export templates are installed, which only `macos-client` needs. |
+| the export | **not** `vx export` | It resolves its own Godot. The launcher resolves an editor and then checks it against the checkout's pin; an export that went and found a different one would walk straight past the single check standing between an operator and a build that compiles and then misbehaves at runtime. |
+| packaging | **not** `vx package` | It takes the first `bash` on PATH, which on a default Windows install is the WSL launcher — the trap `BuildTools.ResolveBash` exists to avoid. |
+| the pre-build | **not** `vx build` | It names the game's `.csproj` literally, where `GameCheckout.GameProject` discovers the single root csproj and keeps the game's filename out of this repo. |
+
+In each of the three, the launcher's existing path is the more careful one, so "use the repo's own
+door" would be a regression rather than a tidy-up. `Python 3` and `bash` therefore stay hard
+requirements: `verify-engine-template.py` runs twice per build and `package.sh` lays out the content.
+What vx removed is the TLS failure class on the two large downloads, not the dependency.
 
 Two more files are read and are deliberately *not* in that list, because neither breaks on a rename:
 `nuget.config`, whose dev-local package sources are dropped when the directory they point at is not on

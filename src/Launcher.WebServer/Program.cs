@@ -204,6 +204,11 @@ app.Map("/api/v1/instances/{**path}", async (string? path, HttpContext http,
 app.Map("/api/v1/builds/{**path}", ProxyAsync);
 app.Map("/api/v1/content/{**path}", ProxyAsync);
 
+// Source builds. Proxied like everything else — the runner is what owns a checkout and a toolchain, and
+// the runner is also where the refusal lives that keeps an orchestrator from starting one.
+app.Map("/api/v1/sources", ProxyAsync);
+app.Map("/api/v1/sources/{**path}", ProxyAsync);
+
 // Live console. Log frames flow from the runner, and command lines flow back down as exec calls, so
 // the socket is a view over the same API rather than a second control path.
 app.Map("/api/v1/console/{instance}", async (string instance, HttpContext http,

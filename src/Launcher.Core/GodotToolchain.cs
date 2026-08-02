@@ -188,13 +188,16 @@ public sealed partial record GodotEditor
     /// all.</summary>
     public bool Mono { get; init; }
 
-    /// <summary>Resolve an editor: explicit path, then the environment, then PATH.
+    /// <summary>Resolve an editor: explicit path, then the environment, then the checkout's own
+    /// .godot-bin/, then PATH.
     ///
     /// Discovery is last and never silent - whatever it lands on gets its version checked against the
     /// checkout's pin before anything is built with it.</summary>
-    public static GodotEditor Resolve(string? explicitPath)
+    /// <param name="checkout">The checkout being built, so its repo-local engine can be found. Optional
+    /// because the resolution order above is still meaningful without one.</param>
+    public static GodotEditor Resolve(string? explicitPath, string? checkout = null)
     {
-        var (path, origin) = Locate(explicitPath);
+        var (path, origin) = Locate(explicitPath, checkout);
         var raw = FirstVersionLine(BuildTools.Capture(path, ["--version"]));
 
         if (raw is null)
@@ -259,7 +262,7 @@ public sealed partial record GodotEditor
         return Parts(pinned).SequenceEqual(Parts(actual));
     }
 
-    private static (string Path, string Origin) Locate(string? explicitPath)
+    private static (string Path, string Origin) Locate(string? explicitPath, string? checkout)
     {
         if (explicitPath is { Length: > 0 })
             return File.Exists(explicitPath)
@@ -275,9 +278,34 @@ public sealed partial record GodotEditor
                     : throw new SourceBuildException(SourceFailure.EditorMissing,
                         $"${variable} is set to '{fromEnv}', which does not exist");
 
+        // The checkout's own engine, where `vx setup` installs it and where the game repo's
+        // find-godot.sh and vx's Env.FindGodot both probe before PATH. Ahead of PATH here for the
+        // reason that directory exists at all: two checkouts at two refs can pin two engine versions,
+        // and only a per-checkout install can express that. A PATH hit is one engine shared by every
+        // source an operator has registered, which is the assumption .godot-bin/ was added to break.
+        // The candidate names are vx's list verbatim, because a third resolver that probes a fourth
+        // set of paths is how "which Godot did it actually use" stops having one answer.
+        if (checkout is { Length: > 0 })
+        {
+            var bin = System.IO.Path.Combine(checkout, ".godot-bin");
+            foreach (var candidate in new[]
+                     {
+                         System.IO.Path.Combine(bin, "godot_console.exe"),
+                         System.IO.Path.Combine(bin, "godot.exe"),
+                         System.IO.Path.Combine(bin, "Godot.app", "Contents", "MacOS", "Godot"),
+                         System.IO.Path.Combine(bin, "godot"),
+                     })
+                if (File.Exists(candidate))
+                    return (candidate, ".godot-bin/ in the checkout");
+        }
+
         foreach (var name in new[] { "godot4", "godot", "Godot" })
             if (BuildTools.FindOnPath(name) is { } found)
                 return (PreferConsoleBuild(found), $"PATH ({name})");
+
+        foreach (var candidate in PlatformInstallCandidates())
+            if (File.Exists(candidate))
+                return (PreferConsoleBuild(candidate), "the platform install location");
 
         throw new SourceBuildException(SourceFailure.EditorMissing,
             "no Godot editor found, and a source build needs one to drive the export.\n" +
@@ -288,8 +316,69 @@ public sealed partial record GodotEditor
             "https://godotengine.org/download (`vortex source status <name>` prints which version), " +
             "then either put it on PATH as `godot`, set $VORTEX_GODOT, or record it with " +
             "`vortex source set <name> --godot <path>`.\n" +
+            "  A checkout carrying ./vx can also install its own pinned editor into .godot-bin/ with " +
+            "`./vx setup --profile dev`, which this resolver looks in ahead of PATH — that is the one " +
+            "option which gets the version right by construction rather than by the check below.\n" +
             "  On Windows use the _console build: the plain one detaches from the terminal and the " +
             "build output goes nowhere.");
+    }
+
+    /// <summary>Where an editor is if it was installed normally, probed after PATH.
+    ///
+    /// vx's Env.FindGodot and the game repo's find-godot.sh both look here and this resolver did not.
+    /// On the dev box that meant vx reported a usable 4.6.3 mono editor at C:\Program Files\Godot while
+    /// a source build on the same machine refused for having no editor at all — two answers about one
+    /// box, and the launcher's was the wrong one. An installer that does not touch PATH is the normal
+    /// case on Windows and macOS, so this is most machines rather than an edge.
+    ///
+    /// Windows is enumerated rather than spelled out, which is the one deliberate difference from vx.
+    /// vx names the pinned filename literally, and that is right for a tool that lives in the repo
+    /// doing the pinning; the launcher builds arbitrary refs pinning arbitrary versions, so it takes
+    /// what is installed and lets <see cref="RequireMatches"/> be the thing with an opinion about the
+    /// version. Newest first, so a box with two installs starts from the likelier one and gets a skew
+    /// message naming a real alternative rather than the oldest thing on disk.</summary>
+    private static IEnumerable<string> PlatformInstallCandidates()
+    {
+        if (OperatingSystem.IsMacOS())
+            return ["/Applications/Godot_mono.app/Contents/MacOS/Godot",
+                "/Applications/Godot.app/Contents/MacOS/Godot"];
+
+        if (!OperatingSystem.IsWindows())
+            return ["/usr/local/bin/godot", "/usr/bin/godot"];
+
+        var found = new List<string>();
+
+        foreach (var root in new[]
+                 {
+                     Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                     Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                 })
+        {
+            if (root.Length == 0)
+                continue;
+
+            var dir = System.IO.Path.Combine(root, "Godot");
+            try
+            {
+                if (!Directory.Exists(dir))
+                    continue;
+
+                // Console builds first: the plain one detaches from the terminal, so --version comes
+                // back empty and the export log goes nowhere. PreferConsoleBuild would swap to the twin
+                // anyway; ordering here means the twin is what gets probed rather than what gets fixed.
+                found.AddRange(Directory.EnumerateFiles(dir, "Godot_v*.exe")
+                    .OrderByDescending(f =>
+                        f.Contains("_console", StringComparison.OrdinalIgnoreCase))
+                    .ThenByDescending(f => f, StringComparer.OrdinalIgnoreCase));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // A Program Files this account cannot read is not this method's problem to report; the
+                // refusal below already says no editor was found and names every way to supply one.
+            }
+        }
+
+        return found;
     }
 
     /// <summary>On Windows, prefer Godot_..._console.exe beside the plain binary.

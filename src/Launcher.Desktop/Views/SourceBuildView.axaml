@@ -1,0 +1,151 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Launcher.Desktop.ViewModels"
+             x:Class="Launcher.Desktop.Views.SourceBuildView"
+             x:DataType="vm:SourceBuildViewModel">
+
+  <!-- Five rows: header, form, status, log, footer. Only the LOG has the star height — everything else
+       is Auto and therefore cannot be pushed off the bottom by its own content. That is the fix for a
+       multi-line build error overflowing the sheet: the error lives in a height-capped scroller in the
+       status row, so a twelve-line failure scrolls inside its box instead of shoving the buttons out
+       of the window. -->
+  <Border Background="#161b26" BorderBrush="#263043" BorderThickness="1" CornerRadius="10"
+          Padding="16" Margin="24" MaxWidth="820" HorizontalAlignment="Center">
+    <Grid RowDefinitions="Auto,Auto,Auto,*,Auto">
+
+      <!-- ── header ─────────────────────────────────────────────────────────────────────────── -->
+      <TextBlock Grid.Row="0" Text="BUILD FROM SOURCE" FontSize="11" Foreground="#5a6478"
+                 FontWeight="Bold" Margin="0,0,0,12"/>
+
+      <!-- ── the form ───────────────────────────────────────────────────────────────────────── -->
+      <StackPanel Grid.Row="1" Spacing="8" Margin="0,0,0,12">
+
+        <Grid ColumnDefinitions="88,*,8,160">
+          <TextBlock Grid.Column="0" Text="Source" Foreground="#aeb7c6" FontSize="12"
+                     VerticalAlignment="Center"/>
+          <!-- The picker fills the name box; the name box is what is actually read. Typing a name
+               that exists loads its settings, typing a new one creates it — the list is a shortcut,
+               not the only way in, because the first use of this screen has an empty list and a
+               picker with nothing in it would be a dead end. They bind to different properties on
+               purpose: see PickedSource. -->
+          <ComboBox Grid.Column="1" ItemsSource="{Binding KnownSources}"
+                    SelectedItem="{Binding PickedSource}" HorizontalAlignment="Stretch"
+                    PlaceholderText="pick a configured source" IsEnabled="{Binding !Busy}"/>
+          <TextBox Grid.Column="3" Text="{Binding SourceName}" FontSize="12"
+                   IsEnabled="{Binding !Busy}" Watermark="name"/>
+        </Grid>
+
+        <Grid ColumnDefinitions="88,*">
+          <TextBlock Grid.Column="0" Text="Repository" Foreground="#aeb7c6" FontSize="12"
+                     VerticalAlignment="Center"/>
+          <TextBox Grid.Column="1" Text="{Binding Repo}" FontSize="12" IsEnabled="{Binding !Busy}"/>
+        </Grid>
+
+        <Grid ColumnDefinitions="88,*,8,Auto,8,180">
+          <TextBlock Grid.Column="0" Text="Ref" Foreground="#aeb7c6" FontSize="12"
+                     VerticalAlignment="Center"/>
+          <TextBox Grid.Column="1" Text="{Binding Reference}" FontSize="12"
+                   IsEnabled="{Binding !Busy}" Watermark="branch, tag or sha"/>
+          <TextBlock Grid.Column="3" Text="Preset" Foreground="#aeb7c6" FontSize="12"
+                     VerticalAlignment="Center"/>
+          <ComboBox Grid.Column="5" ItemsSource="{Binding Presets}"
+                    SelectedItem="{Binding SelectedPreset}" HorizontalAlignment="Stretch"
+                    IsEnabled="{Binding !Busy}"/>
+        </Grid>
+
+        <Grid ColumnDefinitions="88,*">
+          <TextBlock Grid.Column="0" Text="Godot" Foreground="#aeb7c6" FontSize="12"
+                     VerticalAlignment="Center"/>
+          <TextBox Grid.Column="1" Text="{Binding GodotPath}" FontSize="12"
+                   IsEnabled="{Binding !Busy}"
+                   Watermark="optional — found on PATH, in $VORTEX_GODOT, .godot-bin/, or the Godot install"/>
+        </Grid>
+
+        <CheckBox IsChecked="{Binding FetchMaps}" IsEnabled="{Binding !Busy}"
+                  Content="Fetch the compiled maps" Foreground="#aeb7c6" FontSize="12"
+                  Margin="88,0,0,0"/>
+      </StackPanel>
+
+      <!-- ── status ─────────────────────────────────────────────────────────────────────────── -->
+      <!-- Its own row rather than a line in the footer. A build runs for tens of minutes and the three
+           questions asked of it — alive? how long? doing what? — do not fit in one string that every
+           progress tick overwrites. The outcome then survives here instead of scrolling away. -->
+      <Border Grid.Row="2" Margin="0,0,0,10" Padding="12,10" CornerRadius="8"
+              Background="#1a2130" BorderBrush="#263043" BorderThickness="1"
+              IsVisible="{Binding StatusHeadline, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+        <StackPanel Spacing="6">
+          <Grid ColumnDefinitions="Auto,10,Auto,*,Auto">
+            <!-- One of three, never two: Busy wins while running, then the outcome colours it. -->
+            <TextBlock Grid.Column="0" Text="●" FontSize="13" VerticalAlignment="Center"
+                       Foreground="#7fd4ff" IsVisible="{Binding Busy}"/>
+            <TextBlock Grid.Column="0" Text="✓" FontSize="13" VerticalAlignment="Center"
+                       Foreground="#8fd4a0" IsVisible="{Binding Succeeded}"/>
+            <TextBlock Grid.Column="0" Text="✕" FontSize="13" VerticalAlignment="Center"
+                       Foreground="#ff8787" IsVisible="{Binding Failed}"/>
+
+            <TextBlock Grid.Column="2" Text="{Binding StatusHeadline}" FontSize="13"
+                       FontWeight="SemiBold" Foreground="#e8ecf4" VerticalAlignment="Center"/>
+
+            <TextBlock Grid.Column="4" Text="{Binding Elapsed}" FontSize="12" Foreground="#8892a6"
+                       FontFamily="Consolas,Menlo,monospace" VerticalAlignment="Center"/>
+          </Grid>
+
+          <ProgressBar IsIndeterminate="True" IsVisible="{Binding Busy}" Height="3" CornerRadius="2"/>
+
+          <!-- What it is doing right now. Single line and trimmed: this is a liveness signal, and a
+               wrapping one would resize the status box on every log line. -->
+          <TextBlock Text="{Binding CurrentActivity}" FontSize="11" Foreground="#8892a6"
+                     FontFamily="Consolas,Menlo,monospace" TextTrimming="CharacterEllipsis"
+                     IsVisible="{Binding Busy}"/>
+
+          <!-- The outcome. Capped and scrollable, because a failure detail carries the last twelve
+               lines of the toolchain output and used to run off the bottom of the sheet. -->
+          <ScrollViewer MaxHeight="96" HorizontalScrollBarVisibility="Disabled"
+                        IsVisible="{Binding StatusDetail, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+            <SelectableTextBlock Text="{Binding StatusDetail}" TextWrapping="Wrap" FontSize="11"
+                                 Foreground="#cfd6e4"/>
+          </ScrollViewer>
+        </StackPanel>
+      </Border>
+
+      <!-- ── the log ────────────────────────────────────────────────────────────────────────── -->
+      <Border Grid.Row="3" Background="#0d1017" BorderBrush="#263043" BorderThickness="1"
+              CornerRadius="6" Padding="8" MinHeight="120">
+        <Grid>
+          <!-- SelectableTextBlock over one string, not an ItemsControl of lines: the whole point is
+               being able to drag across the error and copy it. Per-line TextBlocks looked identical
+               and could not be selected at all. -->
+          <ScrollViewer Name="LogScroller" HorizontalScrollBarVisibility="Auto">
+            <SelectableTextBlock Text="{Binding LogText}"
+                                 FontFamily="Consolas,Menlo,monospace" FontSize="11"
+                                 Foreground="#8892a6"/>
+          </ScrollViewer>
+
+          <TextBlock Text="The build log appears here. Check first if you are not sure this box has what it needs."
+                     Foreground="#4a5468" FontSize="11" TextWrapping="Wrap"
+                     VerticalAlignment="Top" IsVisible="{Binding !HasLog}"/>
+        </Grid>
+      </Border>
+
+      <!-- ── footer ─────────────────────────────────────────────────────────────────────────── -->
+      <Grid Grid.Row="4" ColumnDefinitions="Auto,*,Auto" Margin="0,12,0,0">
+        <Button Grid.Column="0" Content="Copy log" Command="{Binding CopyLogCommand}" Padding="12,6"
+                FontSize="12" ToolTip.Tip="Copy the whole log to the clipboard"/>
+
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8">
+          <Button Content="Close" Command="{Binding CloseCommand}" Padding="14,6"/>
+          <Button Content="Cancel" Command="{Binding CancelCommand}" Padding="14,6"
+                  IsVisible="{Binding Busy}"/>
+          <Button Content="Check" Command="{Binding CheckCommand}" Padding="14,6"/>
+          <!-- Separate from Build and only live once there is something to use, because a build that
+               lands is not automatically the build you want to be playing — see the view model. -->
+          <Button Content="Use this build" Command="{Binding UseBuildCommand}" Padding="14,6"
+                  IsVisible="{Binding BuiltReady}" Background="#2f9e44" Foreground="White"/>
+          <Button Content="Build" Command="{Binding BuildCommand}" Padding="20,6"
+                  Background="#2a72b5" Foreground="White"/>
+        </StackPanel>
+      </Grid>
+
+    </Grid>
+  </Border>
+</UserControl>

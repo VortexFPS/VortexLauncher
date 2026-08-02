@@ -172,7 +172,11 @@ public static class SourceCommands
                     $"no source '{parse.GetValue(name)}'; `vortex source list` shows what is configured",
                     ExitCodes.NotFound);
 
-            var report = new SourceProvider(paths, new BuildStore(paths)).Inspect(spec);
+            // Streamed for the same reason `build` streams: the vx doctor pass inside Inspect builds
+            // vx's own task runner the first time it runs in a checkout, and tens of silent seconds in
+            // a verb that otherwise answers instantly reads as a hang.
+            var report = new SourceProvider(paths, new BuildStore(paths))
+                .Inspect(spec, new Progress<string>(output.Progress));
 
             if (output.IsJson)
             {
@@ -193,6 +197,23 @@ public static class SourceCommands
                     tools = report.Tools.Select(t => new { t.Name, ok = t.Ok, path = t.Path, t.Problem }),
                     ready = report.Ready,
                     problems = report.Problems,
+                    // Null when the ref predates vx, or when doctor could not be read. Nested rather
+                    // than merged into `tools` so a consumer can tell which side of the repo boundary
+                    // each verdict came from, and so `ready` keeps meaning only what the launcher
+                    // decided about a build it is about to run.
+                    vx = report.VxDoctor is null ? null : (object)new
+                    {
+                        ok = report.VxDoctor.Ok,
+                        unsupported_schema = report.VxDoctor.UnsupportedSchema,
+                        checks = report.VxDoctor.Checks.Select(c => new
+                        {
+                            name = c.Name,
+                            status = c.Status,
+                            detail = c.Detail,
+                            required = c.Required,
+                            fix = c.Fix,
+                        }),
+                    },
                     last_build_id = report.LastBuildId,
                     last_built_at = report.LastBuiltAt,
                 });
@@ -217,6 +238,29 @@ public static class SourceCommands
                 // line that says missing sends the operator to install a second copy of what they
                 // already have.
                 output.Line($"  {tool.Name,-10} {(tool.Ok ? tool.Path : "unusable (see below)")}");
+
+            // vx's own verdict, kept visually under the launcher's checks and never mixed into them:
+            // these do not decide `ready`, and printing them in the same list would say they did. Only
+            // the non-ok lines, because the interesting content is short and the full list is fifteen
+            // rows of "present".
+            if (report.VxDoctor is { } doctor)
+            {
+                if (doctor.UnsupportedSchema is { } schema)
+                    output.Line($"  vx doctor  speaks --json schema {schema}; this launcher reads " +
+                                $"{Vx.SupportedSchema}, so its report was not read");
+                else
+                {
+                    var notable = doctor.Checks
+                        .Where(c => !string.Equals(c.Status, "ok", StringComparison.Ordinal))
+                        .ToList();
+
+                    output.Line($"  vx doctor  {(doctor.Ok ? "no blocking items" : "reports blocking items")}" +
+                                (notable.Count == 0 ? ", everything it checks is present" : ""));
+
+                    foreach (var check in notable)
+                        output.Line($"    {(check.Required ? "!" : "-")} {check.Name}: {check.Detail}");
+                }
+            }
 
             if (report.LastBuildId is not null)
                 output.Line($"  last build {report.LastBuildId} ({report.LastBuiltAt:yyyy-MM-dd HH:mm})");
@@ -253,8 +297,8 @@ public static class SourceCommands
         };
         var skipMaps = new Option<bool>("--skip-maps")
         {
-            Description = "do not run tools/data/fetch-maps.py; the build ships without playable maps " +
-                          "unless the checkout already has them",
+            Description = "skip the map fetch; the build ships without playable maps unless the " +
+                          "checkout already has them",
         };
 
         var command = new Command("build", "compile a source and stage it in the build store");

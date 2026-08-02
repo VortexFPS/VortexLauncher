@@ -134,6 +134,12 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
         public required IReadOnlyList<ToolReport> Tools { get; init; }
         public required IReadOnlyList<string> Problems { get; init; }
         public bool Ready => Problems.Count == 0;
+
+        /// <summary>What `vx doctor --json` said about this checkout, when the ref carries vx and it
+        /// answered. Reported beside <see cref="Problems"/> and deliberately not merged into it — see
+        /// <see cref="Inspect"/> for why a vx finding must not decide <see cref="Ready"/>.</summary>
+        public VxDoctorReport? VxDoctor { get; init; }
+
         public string? LastBuildId { get; init; }
         public DateTimeOffset? LastBuiltAt { get; init; }
     }
@@ -158,6 +164,13 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
         return null;
     }
 
+    /// <summary>Every preset a build can target, out of the same table <see cref="PlatformKeyForPreset"/>
+    /// inverts. Derived rather than listed so a picker cannot offer one that <see cref="Stage"/> would
+    /// then refuse for having no manifest platform key — the operator would have spent a whole export
+    /// finding that out.</summary>
+    public static IReadOnlyList<string> KnownPresets =>
+        PlatformKey.ZipSuffixMap.Values.Select(v => v.Root).ToList();
+
     public async Task<Result> BuildAsync(SourceSpec spec, bool fetchMaps, IProgress<string>? log,
         CancellationToken ct = default)
     {
@@ -176,7 +189,7 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
             var template = ResolveTemplate(pin, preset, checkout);
             var platformKey = PlatformKeyForPreset(preset)!;
 
-            var editor = GodotEditor.Resolve(spec.GodotPath);
+            var editor = GodotEditor.Resolve(spec.GodotPath, checkout);
             editor.RequireMatches(pin, GameCheckout.EngineLockPath(checkout));
             log?.Report($"godot {editor.RawVersion} at {editor.Path}");
 
@@ -184,6 +197,29 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
             var bash = BuildTools.ResolveBash();
 
             await RepairNuGetSourcesAsync(checkout, dotnet, log, ct);
+
+            // Looked for after the NuGet repair for an ordering reason rather than a stylistic one: the
+            // first vx call below builds vx's own task runner with `dotnet build` on a cold checkout, and
+            // a dev-local package source that is not on this box fails that restore exactly the way it
+            // fails the game's. Repair first, then vx works on the same boxes the rest of this does.
+            var vx = Vx.Find(checkout);
+
+            // Warmed before it is relied on. The shim compiles vx's task runner on a cold checkout, and
+            // that compile has its own ways to fail — a restore that cannot reach nuget.org, or its
+            // output still held by a lingering MSBuild worker (CS2012). Finding that out in the middle
+            // of the template fetch would fail a build that had a perfectly good alternative sitting
+            // right there; finding it out here costs one no-op call and turns it into a fallback.
+            if (vx is not null && !vx.Warm(TimeSpan.FromMinutes(5), log))
+            {
+                log?.Report("./vx is present but could not start — using the tools/ scripts for this build");
+                vx = null;
+            }
+
+            var vxEnv = vx is null ? null : Vx.BuildEnvironment;
+
+            log?.Report(vx is null
+                ? "content fetches use the tools/ scripts directly"
+                : $"content fetches go through {Relative(checkout, vx.ShimPath)}");
 
             // Godot writes its import cache on first open. Non-fatal on purpose: a headless import
             // reports missing-dependency warnings as a non-zero exit on a tree that exports fine, and
@@ -194,11 +230,24 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
 
             log?.Report($"fetching the pinned {template.Platform} export template " +
                         $"({pin.TemplateTag ?? "untagged"})");
-            await RunAsync(python,
-                [Script(checkout, GameCheckout.FetchTemplateScript(checkout),
+
+            // `vx engine --only <platform>` reads the same template.platforms object EnginePin has just
+            // parsed, so the key is always one vx accepts, and it verifies the same sha256 into the same
+            // tools/engine-templates/. What changes is the transport, and that is the whole point: vx
+            // downloads with HttpClient where the script uses urllib, and urllib on a python.org macOS
+            // install has no usable CA bundle — it dies CERTIFICATE_VERIFY_FAILED four retries deep on a
+            // box that is otherwise ready to build. Calling the script is how the launcher inherited that.
+            (string Exe, IReadOnlyList<string> Args) fetchTemplate = vx is not null
+                ? vx.Command("engine", "--only", template.Platform)
+                : (python, new[]
+                {
+                    Script(checkout, GameCheckout.FetchTemplateScript(checkout),
                         "tools/data/fetch-engine-template.py"),
-                    "--only", template.Platform],
-                checkout, log, ct, failureCode: SourceFailure.TemplateFetchFailed);
+                    "--only", template.Platform,
+                });
+
+            await RunAsync(fetchTemplate.Exe, fetchTemplate.Args,
+                checkout, log, ct, failureCode: SourceFailure.TemplateFetchFailed, environment: vxEnv);
 
             // Before the export, not after: this catches an emptied custom_template/release in
             // seconds, and that is G10's actual cause. Godot does not fail on an empty field, it
@@ -247,10 +296,19 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
             if (fetchMaps)
             {
                 log?.Report("fetching compiled maps");
-                await RunAsync(python,
-                    [Script(checkout, GameCheckout.FetchMapsScript(checkout),
-                        "tools/data/fetch-maps.py")],
-                    checkout, log, ct);
+                // Same trade as the template above, over the same lockfile-and-sha256 contract and into
+                // the same data/maps/. This is the bigger download of the two, so it is also the one
+                // that hurts most to lose several hundred megabytes into a TLS error.
+                (string Exe, IReadOnlyList<string> Args) fetchMapPacks = vx is not null
+                    ? vx.Command("maps")
+                    : (python, new[]
+                    {
+                        Script(checkout, GameCheckout.FetchMapsScript(checkout),
+                            "tools/data/fetch-maps.py"),
+                    });
+
+                await RunAsync(fetchMapPacks.Exe, fetchMapPacks.Args, checkout, log, ct,
+                    environment: vxEnv);
             }
 
             // package.sh lays content, licences and the launch script beside the binary, which is what
@@ -302,7 +360,14 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
     ///
     /// Collects every problem rather than stopping at the first, because the answer an operator wants
     /// is the whole list of things to install, not one of them per five-minute round trip.</summary>
-    public Preflight Inspect(SourceSpec spec)
+    /// <param name="log">Receives progress from the vx doctor pass, whose first run on a cold checkout
+    /// spends tens of seconds building vx's task runner.</param>
+    /// <param name="vxDoctorTimeout">How long the vx doctor pass may take. <see cref="TimeSpan.Zero"/>
+    /// skips it. Callers with a deadline of their own have to be able to say so: the runner API answers
+    /// inside a 30-second command envelope, and the default here is generous because a cold checkout
+    /// builds vx's task runner before doctor says anything.</param>
+    public Preflight Inspect(SourceSpec spec, IProgress<string>? log = null,
+        TimeSpan? vxDoctorTimeout = null)
     {
         var checkout = CheckoutFor(spec.Name);
         var problems = new List<string>();
@@ -374,7 +439,7 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
         {
             try
             {
-                var editor = GodotEditor.Resolve(spec.GodotPath);
+                var editor = GodotEditor.Resolve(spec.GodotPath, checkout);
                 editor.RequireMatches(pin, GameCheckout.EngineLockPath(checkout));
                 tools.Add(new ToolReport("godot", true, $"{editor.Path} ({editor.RawVersion})", null));
             }
@@ -393,6 +458,18 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
         var templatePresent = templatePath is not null && File.Exists(templatePath) &&
                               (template!.Bytes == 0 || new FileInfo(templatePath).Length == template.Bytes);
 
+        // The checkout's own read of this box, when the ref carries vx.
+        //
+        // Additive, and deliberately never added to `problems`. vx doctor answers a broader question
+        // than "can this build start" — map packs, the perf tooling, curl and unzip — so letting one of
+        // its findings decide Ready would refuse builds that succeed. It is worth having anyway for one
+        // check the launcher cannot make: whether the EDITOR's stock export templates are installed.
+        // macos-client exports from a stock template by declared exception, so on a Mac that is the
+        // difference between a build that works and one that dies after twenty minutes of export, and
+        // nothing on this side of the repo boundary can see it.
+        var budget = vxDoctorTimeout ?? TimeSpan.FromMinutes(2);
+        var vxDoctor = budget <= TimeSpan.Zero ? null : Vx.Find(checkout)?.Doctor(budget, log);
+
         return new Preflight
         {
             Name = spec.Name,
@@ -409,6 +486,7 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
             TemplatePresent = templatePresent,
             Tools = tools,
             Problems = problems,
+            VxDoctor = vxDoctor,
             LastBuildId = spec.LastBuildId,
             LastBuiltAt = spec.LastBuiltAt,
         };
@@ -686,7 +764,8 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
 
     private static async Task RunAsync(string exe, IReadOnlyList<string> args, string workingDir,
         IProgress<string>? log, CancellationToken ct, bool allowFailure = false,
-        string failureCode = SourceFailure.StepFailed)
+        string failureCode = SourceFailure.StepFailed,
+        IReadOnlyDictionary<string, string>? environment = null)
     {
         var psi = new ProcessStartInfo(exe)
         {
@@ -698,6 +777,9 @@ public sealed class SourceProvider(LauncherPaths paths, BuildStore builds)
         };
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
+        if (environment is not null)
+            foreach (var (name, value) in environment)
+                psi.Environment[name] = value;
 
         Process process;
         try

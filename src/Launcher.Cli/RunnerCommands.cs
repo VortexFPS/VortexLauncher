@@ -78,8 +78,10 @@ public static class RunnerCommands
             var conductorUrl = config.ConductorControl ? config.ConductorUrl : null;
 
             var contentHttp = LauncherHttp.Create();
+            // paths last: it is what the /sources routes read specs and checkouts out of, and a
+            // dispatcher built without one answers them 404 rather than failing to start.
             var dispatcher = new CommandDispatcher(supervisor, new BuildStore(paths),
-                new ContentFetcher(paths, contentHttp), config.ContentBaseUrl, conductorUrl);
+                new ContentFetcher(paths, contentHttp), config.ContentBaseUrl, conductorUrl, paths);
             var links = new List<RunnerLink>();
 
             // The owner's own control plane. Outbound even though it is usually on this same box.

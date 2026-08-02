@@ -72,6 +72,7 @@ public partial class MainWindowViewModel : ObservableObject
     [NotifyCanExecuteChangedFor(nameof(PrimaryActionCommand))]
     [NotifyCanExecuteChangedFor(nameof(CancelCommand))]
     [NotifyCanExecuteChangedFor(nameof(OpenSettingsCommand))]
+    [NotifyCanExecuteChangedFor(nameof(OpenSourceBuildCommand))]
     [NotifyCanExecuteChangedFor(nameof(ApplyStagedCommand))]
     [NotifyCanExecuteChangedFor(nameof(RestartForLauncherUpdateCommand))]
     [NotifyCanExecuteChangedFor(nameof(DownloadLauncherUpdateCommand))]
@@ -113,6 +114,10 @@ public partial class MainWindowViewModel : ObservableObject
     /// <summary>The settings sheet, shown over this screen.</summary>
     public SettingsViewModel Settings { get; }
 
+    /// <summary>The build-from-source sheet. Shown over this screen for the same reason Settings is:
+    /// what is installed stays visible behind the thing that is about to produce another one.</summary>
+    public SourceBuildViewModel SourceBuild { get; }
+
     /// <summary>The first-run notification question, shown over everything else.</summary>
     public FirstRunViewModel FirstRun { get; }
 
@@ -127,7 +132,19 @@ public partial class MainWindowViewModel : ObservableObject
     public MainWindowViewModel()
     {
         _settings = _settingsStore.Load();
+
+        // Before Bind, which rebinds it: the sheet has to exist by the time the first bind runs, and
+        // building it here rather than inside Bind is what keeps a settings change from replacing the
+        // view model out from under an open sheet.
+        SourceBuild = new SourceBuildViewModel(new LauncherPaths(_settings.InstallRoot));
+
         Bind(_settings);
+
+        // After Bind, because the Applied handler reads _installs and Bind is what assigns it. The
+        // handler could not run before this point either way, but writing it above would be asking the
+        // reader to know that.
+        SourceBuild.IsGameRunning = () => GameIsRunning;
+        SourceBuild.Applied += () => ShowInstalled(_installs.LoadCurrent());
 
         Settings = new SettingsViewModel(_settingsStore, _settings);
         Settings.Applied += OnSettingsApplied;
@@ -150,11 +167,16 @@ public partial class MainWindowViewModel : ObservableObject
     [MemberNotNull(nameof(_installs), nameof(_game), nameof(_feed), nameof(_notifier))]
     private void Bind(LauncherSettings settings)
     {
-        _installs = new InstallService(new LauncherPaths(settings.InstallRoot), new DownloadService(_http));
+        var paths = new LauncherPaths(settings.InstallRoot);
+        _installs = new InstallService(paths, new DownloadService(_http));
         _game = new GameLauncher(_installs);
         _feed = ChannelFeeds.FeedFor(_http, settings.Channel);
         _notifier = Notifiers.For(settings);
         ChannelText = settings.IsBeta ? "beta — pre-releases included" : "stable";
+
+        // The checkouts, the build store and current.json all hang off the root, so a sheet still
+        // pointed at the old one would build into one place and pin in another.
+        SourceBuild.Bind(paths);
     }
 
     private void OnSettingsApplied(LauncherSettings settings)
@@ -249,6 +271,12 @@ public partial class MainWindowViewModel : ObservableObject
     /// <summary>Closed mid-install: changing the install root under a running download would strand
     /// the half-written staging directory at the old root.</summary>
     private bool CanOpenSettings() => !Busy;
+
+    /// <summary>Build the game from a git checkout. Same guard as Settings, and for a sharper version
+    /// of the same reason: a build stages into versions/ and so does the download this would be
+    /// running alongside.</summary>
+    [RelayCommand(CanExecute = nameof(CanOpenSettings))]
+    private void OpenSourceBuild() => SourceBuild.Open();
 
     [RelayCommand(CanExecute = nameof(CanRefresh))]
     private async Task RefreshAsync()

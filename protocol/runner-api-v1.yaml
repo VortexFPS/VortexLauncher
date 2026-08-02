@@ -31,6 +31,11 @@ tags:
       what stops two planes racing on one instance.
   - name: builds
   - name: content
+  - name: sources
+    description: |
+      Building the game from a git checkout instead of installing a published release. Reads are open
+      to both planes; everything that mutates is refused unless it came from the host owner's own
+      plane, because these routes compile a repository named in the request.
 
 paths:
   /healthz:
@@ -402,6 +407,135 @@ paths:
             application/json:
               schema: { type: array, items: { $ref: "#/components/schemas/ContentPackage" } }
 
+  /api/v1/sources:
+    get:
+      tags: [sources]
+      summary: Configured sources
+      description: |
+        A source is a named repo and ref this box can build. `target` is resolved rather than left
+        null, because null means "this platform's default" and the plane reading it may not be on
+        this platform.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Source" } }
+    post:
+      tags: [sources]
+      summary: Create or update a source
+      description: |
+        Updates in place: a body naming only `name` and `ref` changes only the ref and keeps the repo
+        the source was pointed at. A verb that reset the fields it was not given would make changing
+        a ref a two-field operation nobody would remember to complete.
+
+        Local origin only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SourceRequest" }
+      responses:
+        "200":
+          description: Updated
+          content: { application/json: { schema: { $ref: "#/components/schemas/Source" } } }
+        "201":
+          description: Created
+          content: { application/json: { schema: { $ref: "#/components/schemas/Source" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/OwnerOnly" }
+
+  /api/v1/sources/{name}:
+    parameters: [{ $ref: "#/components/parameters/SourceName" }]
+    get:
+      tags: [sources]
+      summary: Can this box build this source, and against which engine
+      description: |
+        Collects every problem rather than stopping at the first, because the answer wanted is the
+        whole list of things to install and not one of them per round trip.
+
+        `vx` carries the checkout's own `./vx doctor --json`, when the ref has vx and it answered
+        inside the budget this route allows it. It is reported beside `problems` and never merged
+        into them: it answers a broader question than "can this build start", so one of its findings
+        must not decide `ready`. Null means the ref predates vx, or doctor did not answer.
+      responses:
+        "200":
+          description: OK
+          content: { application/json: { schema: { $ref: "#/components/schemas/SourceStatus" } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [sources]
+      summary: Forget a source
+      description: |
+        Deliberately leaves the checkout on disk. The spec is four fields; the checkout is gigabytes,
+        and re-cloning it because a name was removed by mistake is an expensive way to learn that.
+
+        Local origin only.
+      responses:
+        "204": { description: Removed }
+        "403": { $ref: "#/components/responses/OwnerOnly" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/sources/{name}/build:
+    parameters: [{ $ref: "#/components/parameters/SourceName" }]
+    get:
+      tags: [sources]
+      summary: The current or most recent build job
+      description: |
+        The last job is kept after it ends rather than cleared: the poll that discovers a build
+        finished is a different call from the one that started it, so dropping the record on
+        completion would make success and "never heard of it" the same answer. 404 until one has run
+        since the runner started.
+      responses:
+        "200":
+          description: OK
+          content: { application/json: { schema: { $ref: "#/components/schemas/SourceBuildJob" } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [sources]
+      summary: Start a build
+      description: |
+        Answers **202 with a job that has started**, not a build that has finished. Every other verb
+        in this API answers inside the 30-second command envelope; a source build clones, compiles,
+        exports and packages, and runs for tens of minutes. Poll the GET above.
+
+        One at a time per box: two builds contend for the same cores, the same disk and — if they
+        name the same source — the same checkout directory, where the second one's `git checkout
+        --force` would pull the tree out from under the first. A second call gets 409.
+
+        Local origin only.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SourceBuildRequest" }
+      responses:
+        "202":
+          description: Started
+          content: { application/json: { schema: { $ref: "#/components/schemas/SourceBuildJob" } } }
+        "403": { $ref: "#/components/responses/OwnerOnly" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: A build is already running on this box
+          content: { application/json: { schema: { $ref: "#/components/schemas/ApiError" } } }
+
+  /api/v1/sources/{name}/build/cancel:
+    parameters: [{ $ref: "#/components/parameters/SourceName" }]
+    post:
+      tags: [sources]
+      summary: Stop the running build
+      description: |
+        Kills the toolchain process tree. A cancelled build leaves its checkout and any content it
+        already fetched, so the next attempt resumes from there rather than re-cloning.
+
+        Local origin only.
+      responses:
+        "200":
+          description: Cancelling
+          content: { application/json: { schema: { $ref: "#/components/schemas/SourceBuildJob" } } }
+        "403": { $ref: "#/components/responses/OwnerOnly" }
+        "404": { description: Nothing was running }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -420,6 +554,16 @@ components:
         find the thing they just created. '.' and '..' are excluded for the obvious reason.
       schema: { type: string, pattern: '^(?!\.\.?$)[A-Za-z0-9._-]{1,64}$' }
 
+    SourceName:
+      name: name
+      in: path
+      required: true
+      description: |
+        Same rule as an instance name and for the same reason: it becomes the directory the checkout
+        lives in. Checkouts are keyed on this rather than on the repo's basename, so two sources
+        pointing at different forks do not share one working tree and thrash it on every build.
+      schema: { type: string, pattern: '^(?!\.\.?$)[A-Za-z0-9._-]{1,64}$' }
+
   responses:
     BadRequest:
       description: Malformed request
@@ -430,6 +574,20 @@ components:
     Conflict:
       description: Refused in the current state
       content: { application/json: { schema: { $ref: "#/components/schemas/ApiError" } } }
+    OwnerOnly:
+      description: |
+        Refused because the call did not come from the host owner's own plane. Only the source routes
+        answer this, and only the ones that mutate: they compile a repository named in the request,
+        which exposed to an orchestrator would be arbitrary code execution addressed by URL — a
+        different thing from the instance routes, which only ever start a binary already in the build
+        store. An orchestrator keeps every read, including watching a running build.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+          example:
+            code: scope_denied
+            message: "source builds are the host owner's alone"
+
     Orchestrated:
       description: |
         The instance is under orchestrator control, so this mutating call is refused. The body names
@@ -593,6 +751,172 @@ components:
           nullable: true
           description: Where a runner, or a joining player, fetches it. Content-addressed, so it is
             cacheable and safe to hand to a CDN.
+
+    Source:
+      type: object
+      required: [name, repo, ref, target]
+      properties:
+        name: { type: string }
+        repo: { type: string, description: "git URL; defaults to the game repo, forks are the point" }
+        ref: { type: string, description: "branch, tag or sha" }
+        target:
+          type: string
+          description: |
+            Export preset. Always resolved: a stored source may not name one, and the default is the
+            platform's, which the plane reading this may not share.
+          enum: [windows-client, linux-client, linux-dedicated, macos-client]
+        godot:
+          type: string
+          nullable: true
+          description: |
+            Where this box's Godot editor is, when it is not discoverable. Per source rather than
+            global because two sources can pin two engine versions.
+        last_build_id: { type: string, nullable: true }
+        last_built_sha: { type: string, nullable: true }
+        last_built_at: { type: string, format: date-time, nullable: true }
+
+    SourceRequest:
+      type: object
+      required: [name]
+      description: |
+        Every field but the name is optional, because this updates in place. Absent is "leave it
+        alone", not "clear it".
+      properties:
+        name: { type: string, pattern: '^(?!\.\.?$)[A-Za-z0-9._-]{1,64}$' }
+        repo: { type: string }
+        ref: { type: string }
+        target: { type: string, enum: [windows-client, linux-client, linux-dedicated, macos-client] }
+        godot: { type: string }
+
+    SourceStatus:
+      type: object
+      properties:
+        name: { type: string }
+        repo: { type: string }
+        ref: { type: string }
+        checkout: { type: string, description: Where the working tree is, whether or not it exists yet }
+        checked_out: { type: boolean }
+        sha: { type: string, nullable: true, description: "HEAD, or null if git cannot name one" }
+        preset: { type: string }
+        platform_key: { type: string, nullable: true }
+        engine_version:
+          type: string
+          nullable: true
+          description: |
+            Read from the checkout's own tools/engine-patches/engine.lock.json, which is the file CI
+            and verify-engine-template.py already check against. Prose in docs drifts; a lockfile is
+            what gets trusted.
+        engine_tag: { type: string, nullable: true }
+        template_present:
+          type: boolean
+          description: |
+            Cached and the right size. Present is not verified — the build re-checks the sha256
+            through the tool that owns that answer.
+        tools:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              ok: { type: boolean }
+              path: { type: string, nullable: true }
+              problem: { type: string, nullable: true }
+        ready:
+          type: boolean
+          description: The launcher's verdict, and only the launcher's. `vx` below never changes it.
+        problems: { type: array, items: { type: string } }
+        vx:
+          type: object
+          nullable: true
+          description: |
+            The checkout's own `./vx doctor --json`. Null when the ref predates vx or doctor did not
+            answer in the budget this route allows it. Worth reading for one check nothing on the
+            launcher's side can make: whether the editor's stock export templates are installed,
+            which macos-client exports need and no other preset does.
+          properties:
+            ok: { type: boolean, description: vx's verdict on its own required items }
+            unsupported_schema:
+              type: integer
+              nullable: true
+              description: |
+                Set, with the number vx sent, when it is not one the launcher reads; `checks` is
+                empty in that case. Reporting a schema nobody understood as "nothing wrong" is the
+                failure the version field exists to prevent.
+            checks:
+              type: array
+              items:
+                type: object
+                properties:
+                  name: { type: string }
+                  status: { type: string, enum: [ok, warn, missing] }
+                  detail: { type: string }
+                  required: { type: boolean }
+                  fix: { type: string, nullable: true }
+        last_build_id: { type: string, nullable: true }
+        last_built_at: { type: string, format: date-time, nullable: true }
+
+    SourceBuildRequest:
+      type: object
+      properties:
+        target:
+          type: string
+          description: Overrides the source's preset for one run without rewriting the spec.
+          enum: [windows-client, linux-client, linux-dedicated, macos-client]
+        fetch_maps:
+          type: boolean
+          default: true
+          description: |
+            Defaults true. A build with no maps starts and then finds nothing to load, which reads as
+            a broken game rather than a partial build, so it is not what saying nothing should get.
+
+    SourceBuildJob:
+      type: object
+      required: [source_name, ref, state, started_at]
+      properties:
+        source_name: { type: string }
+        ref: { type: string }
+        state: { type: string, enum: [running, succeeded, failed, cancelled] }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+        build_id:
+          type: string
+          nullable: true
+          description: |
+            The build store id once there is one. This is the handle `builds pin` and
+            `server create --build` take, and it is what a plane is waiting for.
+        sha: { type: string, nullable: true }
+        preset: { type: string, nullable: true }
+        code:
+          type: string
+          nullable: true
+          description: |
+            Why it failed, as a code rather than prose, so a caller can tell "install Godot" from
+            "this ref does not build".
+          enum:
+            - git_missing
+            - dotnet_missing
+            - python_missing
+            - bash_missing
+            - editor_missing
+            - editor_unusable
+            - engine_skew
+            - checkout_incomplete
+            - lockfile_unreadable
+            - preset_unknown
+            - cross_platform
+            - git_failed
+            - template_fetch_failed
+            - export_failed
+            - package_failed
+            - verification_failed
+            - step_failed
+        error: { type: string, nullable: true }
+        log:
+          type: array
+          items: { type: string }
+          description: |
+            The tail of the toolchain output, bounded to the last 500 lines. A twenty-minute export
+            writes more than a process meant to stay up for weeks should keep.
 
     ApiError:
       type: object
