@@ -12,6 +12,9 @@
     <RootNamespace>Launcher.Desktop</RootNamespace>
     <AssemblyName>VortexLauncher</AssemblyName>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <!-- The Win32 executable icon. Separate from the AvaloniaResource tray icon below: this one is
+         stamped into the PE header at build time and is what Explorer and the taskbar read. -->
+    <ApplicationIcon>Assets\app-icon.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
     <!-- The tray icon. Explicit rather than by convention: the Avalonia SDK does not glob Assets/

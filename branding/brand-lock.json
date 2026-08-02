@@ -1,0 +1,27 @@
+{
+  "format": "vortex-brand-lock/1",
+  "tool": "vxbrand 0.1.0",
+  "target": "vortex-launcher",
+  "specSha256": "31d85a39c206112a4ef6e90005e3939ffc73b0b8193ac696a4b97c6823bffce4",
+  "files": {
+    "branding/vortex-launcher-emblem.svg": "d2e8ad6af788ca1b8c983cd202993d180de915650fe9a81f9ffa0d31532ae6f2",
+    "src/Launcher.Desktop/Assets/app-icon.ico": "67460dec92cfeee88bd7e8264e579015ebe4a742bad80b08edd02c70baa3369d",
+    "src/Launcher.Desktop/Assets/app-icon.png": "2b8d64ce61b09ed8cc181988e2c07a4b4e5a6786f32d0e42db54fd7dcbda5732",
+    "src/Launcher.Desktop/Assets/tray-icon.png": "777ef1fdb46cf5e5a04240eefa8a569a267f7ca7ca23f9da393cc89b83ab5450",
+    "src/Launcher.WebServer/wwwroot/favicon.png": "777ef1fdb46cf5e5a04240eefa8a569a267f7ca7ca23f9da393cc89b83ab5450"
+  },
+  "wiring": [
+    {
+      "file": "src/Launcher.Desktop/Launcher.Desktop.csproj",
+      "note": "The project has no ApplicationIcon today, so the built exe carries the default .NET icon."
+    },
+    {
+      "file": "src/Launcher.Desktop/Views/MainWindow.axaml",
+      "note": "Avalonia resolves Icon against the AvaloniaResource root, which Assets/** is already globbed into."
+    },
+    {
+      "file": "src/Launcher.WebServer/wwwroot/index.html",
+      "note": "Relative href, so the panel keeps working on a box with no internet — same rule as the comment above it in the file."
+    }
+  ]
+}

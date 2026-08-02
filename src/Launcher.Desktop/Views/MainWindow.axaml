@@ -6,6 +6,7 @@
         x:Class="Launcher.Desktop.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Title="Vortex Arena Launcher"
+        Icon="/Assets/app-icon.png"
         Width="860" Height="600" MinWidth="680" MinHeight="500"
         WindowStartupLocation="CenterScreen"
         Background="#0d1017">
